@@ -1,4 +1,29 @@
 
+# Beads issue tracker (local, not for public repo)
+.beads/
+AGENTS.md
+
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+
+# macOS
+.DS_Store
+
+# Swift / SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode (when added later)
+*.xcodeproj/
+DerivedData/
+xcuserdata/
+*.xcworkspace/
+
+# Local test resources (symlinks to personal videos, not for git)
+Resources/
+!Resources/.gitkeep
+
+# Generated test outputs
+out/

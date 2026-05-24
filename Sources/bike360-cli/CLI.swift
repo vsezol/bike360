@@ -1,0 +1,439 @@
+import CoreGraphics
+import CoreImage
+import CoreMedia
+import Foundation
+import ImageIO
+import Pipeline
+import UniformTypeIdentifiers
+
+@main
+struct CLI {
+  static func main() async {
+    do {
+      try await run()
+    } catch {
+      FileHandle.standardError.write(Data("Error: \(error)\n".utf8))
+      exit(1)
+    }
+  }
+
+  static func run() async throws {
+    let parsed = try ArgParser.parse(CommandLine.arguments)
+    switch parsed {
+    case .help:
+      printUsage()
+    case .extract(let options):
+      try await runExtract(options: options)
+    }
+  }
+
+  static func runExtract(options: ExtractOptions) async throws {
+    let videoURL = URL(fileURLWithPath: options.videoPath)
+    let outputURL = URL(fileURLWithPath: options.outputDir)
+    try FileManager.default.createDirectory(at: outputURL, withIntermediateDirectories: true)
+
+    let source = InsvVideoSource(url: videoURL)
+    let preprocessing = options.preprocess ? PreprocessingModule() : nil
+    let undistorting: UndistortingModule?
+    if options.undistort {
+      let metal = try MetalContext()
+      undistorting = try UndistortingModule(context: metal, settings: options.undistortSettings)
+    } else {
+      undistorting = nil
+    }
+
+    let started = Date()
+    var currentIndex: UInt64 = 0
+    let targetIndex = UInt64(options.frameIndex)
+
+    for try await stereo in source.frames() {
+      if currentIndex == targetIndex {
+        try await processAndSave(
+          stereo: stereo,
+          options: options,
+          outputDir: outputURL,
+          preprocessing: preprocessing,
+          undistorting: undistorting,
+          startedAt: started
+        )
+        return
+      }
+      currentIndex += 1
+    }
+    throw CLIError.frameOutOfRange(requested: options.frameIndex, available: Int(currentIndex))
+  }
+
+  static func processAndSave(
+    stereo: StereoFrame,
+    options: ExtractOptions,
+    outputDir: URL,
+    preprocessing: PreprocessingModule?,
+    undistorting: UndistortingModule?,
+    startedAt: Date
+  ) async throws {
+    let frame = options.frameIndex
+    var stereoCurrent = stereo
+
+    print("Frame \(frame) read in \(elapsed(since: startedAt))s")
+
+    try writeStereo(stereoCurrent, frame: frame, stage: "raw", to: outputDir)
+
+    if let preprocessing {
+      let t0 = Date()
+      stereoCurrent = try await preprocessing.process(stereoCurrent)
+      print("  preprocessed in \(elapsed(since: t0))s")
+      try writeStereo(stereoCurrent, frame: frame, stage: "preprocessed", to: outputDir)
+    }
+
+    guard let undistorting else {
+      print("  done (no --undistort)")
+      return
+    }
+
+    let t1 = Date()
+    let tiled = try await undistorting.process(stereoCurrent)
+    print("  undistorted into \(tiled.tiles.count) tiles in \(elapsed(since: t1))s")
+
+    try writeTiles(tiled.tiles, frame: frame, to: outputDir)
+    if options.mosaic {
+      try writeMosaics(tiled.tiles, frame: frame, to: outputDir)
+    }
+  }
+
+  static func writeMosaics(_ tiles: [Tile], frame: Int, to dir: URL) throws {
+    for lens in Lens.allCases {
+      let lensTiles = tiles.filter { $0.lens == lens }
+      guard lensTiles.count > 1 else { continue }
+      let url = dir.appendingPathComponent("\(lens.rawValue)_\(frame)_mosaic.png")
+      try MosaicWriter.write(tiles: lensTiles, to: url)
+      print("    \(lens.rawValue) mosaic: \(url.lastPathComponent)")
+    }
+  }
+
+  static func writeStereo(_ stereo: StereoFrame, frame: Int, stage: String, to dir: URL) throws {
+    let frontURL = dir.appendingPathComponent("front_\(frame)_\(stage).png")
+    let backURL = dir.appendingPathComponent("back_\(frame)_\(stage).png")
+    try PNGWriter.write(frame: stereo.front, to: frontURL)
+    try PNGWriter.write(frame: stereo.back, to: backURL)
+    print("    \(stage): \(stereo.front.width)x\(stereo.front.height) (x2)")
+  }
+
+  static func writeTiles(_ tiles: [Tile], frame: Int, to dir: URL) throws {
+    let tilesPerLens = Dictionary(grouping: tiles) { $0.lens }
+    let isSingleTilePerLens = tilesPerLens.values.allSatisfy { $0.count == 1 }
+
+    for tile in tiles {
+      let lensStr = tile.lens.rawValue
+      let suffix: String
+      if isSingleTilePerLens {
+        suffix = "projected"
+      } else {
+        let yawStr = signedTag("yaw", Int(tile.yawDegrees))
+        let pitchStr = tile.pitchDegrees == 0 ? "" : "_" + signedTag("pitch", Int(tile.pitchDegrees))
+        suffix = "tile_\(yawStr)\(pitchStr)"
+      }
+      let url = dir.appendingPathComponent("\(lensStr)_\(frame)_\(suffix).png")
+      try PNGWriter.write(frame: tile.frame, to: url)
+      print("    \(lensStr) \(suffix): \(tile.frame.width)x\(tile.frame.height)")
+    }
+  }
+
+  static func signedTag(_ name: String, _ value: Int) -> String {
+    if value == 0 { return "\(name)0" }
+    return value > 0 ? "\(name)+\(value)" : "\(name)\(value)"
+  }
+
+  static func elapsed(since date: Date) -> String {
+    String(format: "%.2f", Date().timeIntervalSince(date))
+  }
+
+  static func printUsage() {
+    print(
+      """
+      bike360-cli — stage 1 pipeline runner
+
+      Commands:
+        extract <video> <frame_index> [options]
+
+          Read a stereo frame from the .insv (renamed .mp4) file, run it
+          through the requested pipeline stages, and save PNGs for visual
+          inspection of every intermediate state.
+
+          Options:
+            --output-dir DIR    Directory for PNGs.            Default: ./out
+            --preprocess        Apply PreprocessingModule.
+            --undistort         Apply UndistortingModule.
+            --tiles N           Number of rectilinear tiles per lens (1|2|3).
+                                  1 = single centered tile (120° FOV, 1920px)
+                                  2 = two tiles (±50° yaw, 110° FOV, 1280px)
+                                  3 = three tiles (±60°/0° yaw, 90° FOV, 1024px)
+                                Default: 3 (no edge loss, NMS overlap)
+
+      Examples:
+        # raw lenses only
+        bike360-cli extract Resources/test_video_insv.mp4 100
+
+        # multi-tile pipeline (recommended)
+        bike360-cli extract Resources/test_video_insv.mp4 100 \\
+          --preprocess --undistort --tiles 3
+      """
+    )
+  }
+}
+
+struct ExtractOptions {
+  var videoPath: String
+  var frameIndex: Int
+  var outputDir: String = "./out"
+  var preprocess: Bool = false
+  var undistort: Bool = false
+  var mosaic: Bool = false
+  var undistortSettings: UndistortingModule.Settings = .threeTilesPerLens
+}
+
+enum CLIError: Error, CustomStringConvertible {
+  case missingArgument(String)
+  case unknownCommand(String)
+  case invalidValue(name: String, value: String)
+  case frameOutOfRange(requested: Int, available: Int)
+
+  var description: String {
+    switch self {
+    case .missingArgument(let name): return "Missing argument: \(name)"
+    case .unknownCommand(let name): return "Unknown command: \(name)"
+    case .invalidValue(let name, let value): return "Invalid value for \(name): \(value)"
+    case .frameOutOfRange(let requested, let available):
+      return "Frame \(requested) is out of range — video has only \(available) frames"
+    }
+  }
+}
+
+enum ArgParser {
+  enum ParseResult {
+    case help
+    case extract(ExtractOptions)
+  }
+
+  static func parse(_ args: [String]) throws -> ParseResult {
+    guard args.count >= 2 else { return .help }
+    let command = args[1]
+    switch command {
+    case "-h", "--help", "help":
+      return .help
+    case "extract":
+      guard args.count >= 3 else { throw CLIError.missingArgument("video path") }
+      guard args.count >= 4 else { throw CLIError.missingArgument("frame index") }
+      guard let frameIndex = Int(args[3]) else {
+        throw CLIError.invalidValue(name: "frame_index", value: args[3])
+      }
+      var options = ExtractOptions(videoPath: args[2], frameIndex: frameIndex)
+      var i = 4
+      while i < args.count {
+        switch args[i] {
+        case "--output-dir":
+          guard i + 1 < args.count else { throw CLIError.missingArgument("--output-dir value") }
+          options.outputDir = args[i + 1]
+          i += 2
+        case "--preprocess":
+          options.preprocess = true
+          i += 1
+        case "--undistort":
+          options.undistort = true
+          i += 1
+        case "--mosaic":
+          options.mosaic = true
+          i += 1
+        case "--projection":
+          guard i + 1 < args.count else { throw CLIError.missingArgument("--projection value") }
+          options.undistortSettings = try makeProjectionSettings(name: args[i + 1])
+          i += 2
+        case "--tiles":
+          guard i + 1 < args.count, let value = Int(args[i + 1]) else {
+            throw CLIError.invalidValue(name: "--tiles", value: args[safe: i + 1] ?? "")
+          }
+          options.undistortSettings = try makeTileSettings(count: value)
+          i += 2
+        case "--tile-fov":
+          guard i + 1 < args.count, let value = Float(args[i + 1]) else {
+            throw CLIError.invalidValue(name: "--tile-fov", value: args[safe: i + 1] ?? "")
+          }
+          options.undistortSettings = overrideFov(options.undistortSettings, fov: value)
+          i += 2
+        case "--tile-size":
+          guard i + 1 < args.count, let value = Int(args[i + 1]) else {
+            throw CLIError.invalidValue(name: "--tile-size", value: args[safe: i + 1] ?? "")
+          }
+          options.undistortSettings = overrideSize(options.undistortSettings, size: value)
+          i += 2
+        default:
+          throw CLIError.unknownCommand(args[i])
+        }
+      }
+      return .extract(options)
+    default:
+      throw CLIError.unknownCommand(command)
+    }
+  }
+
+  static func makeTileSettings(count: Int) throws -> UndistortingModule.Settings {
+    switch count {
+    case 1: return .singleCenterTile
+    case 2: return .twoTilesPerLens
+    case 3: return .threeTilesPerLens
+    default: throw CLIError.invalidValue(name: "--tiles", value: String(count))
+    }
+  }
+
+  static func makeProjectionSettings(name: String) throws -> UndistortingModule.Settings {
+    switch name {
+    case "stereo", "stereographic":
+      return .stereographicFullHemisphere
+    case "equirect", "equirectangular":
+      return .equirectangularFullHemisphere
+    case "rect", "rectilinear":
+      return .threeTilesPerLens
+    default:
+      throw CLIError.invalidValue(name: "--projection", value: name)
+    }
+  }
+
+  static func overrideFov(_ settings: UndistortingModule.Settings, fov: Float) -> UndistortingModule.Settings {
+    switch settings.projection {
+    case .rectilinear(let tiles):
+      let updated = tiles.map { tile in
+        UndistortingModule.TileConfiguration(
+          yawDegrees: tile.yawDegrees,
+          pitchDegrees: tile.pitchDegrees,
+          horizontalFieldOfViewDegrees: fov,
+          outputWidth: tile.outputWidth,
+          outputHeight: tile.outputHeight
+        )
+      }
+      return UndistortingModule.Settings(projection: .rectilinear(tiles: updated))
+    case .equirectangular(let config):
+      let updated = UndistortingModule.EquirectConfiguration(
+        outputWidth: config.outputWidth,
+        outputHeight: config.outputHeight,
+        horizontalFieldOfViewDegrees: fov,
+        verticalFieldOfViewDegrees: fov
+      )
+      return UndistortingModule.Settings(projection: .equirectangular(updated))
+    case .stereographic(let config):
+      let updated = UndistortingModule.StereographicConfiguration(
+        outputSize: config.outputSize,
+        fieldOfViewDegrees: fov
+      )
+      return UndistortingModule.Settings(projection: .stereographic(updated))
+    }
+  }
+
+  static func overrideSize(_ settings: UndistortingModule.Settings, size: Int) -> UndistortingModule.Settings {
+    switch settings.projection {
+    case .rectilinear(let tiles):
+      let updated = tiles.map { tile in
+        let aspect = Float(tile.outputHeight) / Float(tile.outputWidth)
+        let newHeight = Int(Float(size) * aspect)
+        return UndistortingModule.TileConfiguration(
+          yawDegrees: tile.yawDegrees,
+          pitchDegrees: tile.pitchDegrees,
+          horizontalFieldOfViewDegrees: tile.horizontalFieldOfViewDegrees,
+          outputWidth: size,
+          outputHeight: newHeight
+        )
+      }
+      return UndistortingModule.Settings(projection: .rectilinear(tiles: updated))
+    case .equirectangular(let config):
+      let updated = UndistortingModule.EquirectConfiguration(
+        outputWidth: size,
+        outputHeight: size,
+        horizontalFieldOfViewDegrees: config.horizontalFieldOfViewDegrees,
+        verticalFieldOfViewDegrees: config.verticalFieldOfViewDegrees
+      )
+      return UndistortingModule.Settings(projection: .equirectangular(updated))
+    case .stereographic(let config):
+      let updated = UndistortingModule.StereographicConfiguration(
+        outputSize: size,
+        fieldOfViewDegrees: config.fieldOfViewDegrees
+      )
+      return UndistortingModule.Settings(projection: .stereographic(updated))
+    }
+  }
+}
+
+extension Array {
+  subscript(safe index: Int) -> Element? {
+    indices.contains(index) ? self[index] : nil
+  }
+}
+
+enum PNGWriter {
+  // CIContext is documented thread-safe; the static cache is an unowned shared resource.
+  nonisolated(unsafe) static let context = CIContext()
+  static let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+
+  static func write(frame: Frame, to url: URL) throws {
+    let ciImage = CIImage(cvPixelBuffer: frame.pixelBuffer)
+    try context.writePNGRepresentation(
+      of: ciImage,
+      to: url,
+      format: .RGBA8,
+      colorSpace: colorSpace
+    )
+  }
+}
+
+// Stitches a set of tiles for a single lens into one PNG, laid out as a
+// 2D grid by (yaw, pitch). Rows ordered with the highest pitch on top
+// (sky tiles up, ground tiles down) to read like a normal panorama strip.
+enum MosaicWriter {
+  static func write(tiles: [Tile], to url: URL) throws {
+    let yaws = Array(Set(tiles.map { $0.yawDegrees })).sorted()
+    let pitches = Array(Set(tiles.map { $0.pitchDegrees })).sorted(by: >)
+
+    let tileSize = tiles[0].frame.width
+    let cols = yaws.count
+    let rows = pitches.count
+    let totalWidth = cols * tileSize
+    let totalHeight = rows * tileSize
+
+    guard let context = CGContext(
+      data: nil,
+      width: totalWidth,
+      height: totalHeight,
+      bitsPerComponent: 8,
+      bytesPerRow: 4 * totalWidth,
+      space: PNGWriter.colorSpace,
+      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else {
+      throw CLIError.invalidValue(name: "mosaic", value: "CGContext creation failed")
+    }
+
+    context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: totalWidth, height: totalHeight))
+
+    for tile in tiles {
+      guard let col = yaws.firstIndex(of: tile.yawDegrees),
+            let row = pitches.firstIndex(of: tile.pitchDegrees) else { continue }
+
+      let ciImage = CIImage(cvPixelBuffer: tile.frame.pixelBuffer)
+      guard let cgImage = PNGWriter.context.createCGImage(ciImage, from: ciImage.extent) else { continue }
+
+      // CGContext uses bottom-left origin; PNG semantics put row 0 on top.
+      let cgY = totalHeight - (row + 1) * tileSize
+      context.draw(cgImage, in: CGRect(x: col * tileSize, y: cgY, width: tileSize, height: tileSize))
+    }
+
+    guard let image = context.makeImage() else {
+      throw CLIError.invalidValue(name: "mosaic", value: "context.makeImage() failed")
+    }
+    guard let dest = CGImageDestinationCreateWithURL(
+      url as CFURL, UTType.png.identifier as CFString, 1, nil
+    ) else {
+      throw CLIError.invalidValue(name: "mosaic", value: "CGImageDestinationCreateWithURL failed")
+    }
+    CGImageDestinationAddImage(dest, image, nil)
+    guard CGImageDestinationFinalize(dest) else {
+      throw CLIError.invalidValue(name: "mosaic", value: "CGImageDestinationFinalize failed")
+    }
+  }
+}
