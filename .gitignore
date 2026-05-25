@@ -27,3 +27,6 @@ Resources/
 
 # Generated test outputs
 out/
+
+# Internal docs (planning notes, posts, diagrams — not for public repo)
+internal-docs/

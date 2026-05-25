@@ -27,10 +27,6 @@ swift run bike360-cli extract <video.insv-renamed-to-.mp4> 100 --preprocess --un
 
 Output: 6 PNGs in `out/`, each a flat rectilinear view of one virtual camera (3 per lens, panned -60° / 0° / +60°).
 
-## Architecture
-
-See `docs/architecture-stage-1.excalidraw` for the block diagram and `docs/post-stage-1.md` for the writeup of the design decisions.
-
 ## Stack
 
 - Swift 6 strict concurrency mode
