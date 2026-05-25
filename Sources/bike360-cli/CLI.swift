@@ -24,6 +24,76 @@ struct CLI {
       printUsage()
     case .extract(let options):
       try await runExtract(options: options)
+    case .batch(let options):
+      try await runBatch(options: options)
+    }
+  }
+
+  static func runBatch(options: BatchOptions) async throws {
+    let videoURL = URL(fileURLWithPath: options.videoPath)
+    let outputURL = URL(fileURLWithPath: options.outputDir)
+    try FileManager.default.createDirectory(at: outputURL, withIntermediateDirectories: true)
+
+    let source = InsvVideoSource(url: videoURL)
+    let preprocessing = options.preprocess ? PreprocessingModule() : nil
+    let metal = try MetalContext()
+    let undistorting = try UndistortingModule(context: metal, settings: options.undistortSettings)
+
+    let startIndex = UInt64(options.startFrame)
+    let endIndex = startIndex + UInt64(options.count)
+    var currentIndex: UInt64 = 0
+    var processed = 0
+    let started = Date()
+
+    print("Batch: \(options.count) frames from \(options.startFrame) to \(options.startFrame + options.count - 1)")
+    print("Output: \(outputURL.path)")
+    print("Tiles per frame: \(options.undistortSettings.tileCount * 2) (\(options.undistortSettings.tileCount) per lens × 2 lenses)")
+    print()
+
+    for try await stereo in source.frames() {
+      if currentIndex >= endIndex { break }
+      if currentIndex < startIndex {
+        currentIndex += 1
+        continue
+      }
+
+      var current = stereo
+      if let preprocessing {
+        current = try await preprocessing.process(current)
+      }
+      let tiled = try await undistorting.process(current)
+      try await writeBatchTiles(tiled.tiles, frameIndex: Int(currentIndex), to: outputURL)
+
+      processed += 1
+      if processed % 50 == 0 || processed == options.count {
+        let elapsed = Date().timeIntervalSince(started)
+        let fps = Double(processed) / elapsed
+        let remaining = options.count - processed
+        let eta = Double(remaining) / fps
+        print(String(format: "  %d/%d frames | %.1f fps | ETA %ds", processed, options.count, fps, Int(eta)))
+      }
+      currentIndex += 1
+    }
+
+    let total = Date().timeIntervalSince(started)
+    print()
+    print(String(format: "Done. %d frames in %.1fs (%.1f fps avg, %d PNGs written)",
+                 processed, total, Double(processed) / total, processed * (options.undistortSettings.tileCount * 2)))
+  }
+
+  static func writeBatchTiles(_ tiles: [Tile], frameIndex: Int, to dir: URL) async throws {
+    let frameStr = String(format: "%06d", frameIndex)
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      for tile in tiles {
+        let yawStr = signedTag("yaw", Int(tile.yawDegrees))
+        let pitchStr = tile.pitchDegrees == 0 ? "" : "_" + signedTag("pitch", Int(tile.pitchDegrees))
+        let lensStr = tile.lens.rawValue
+        let url = dir.appendingPathComponent("\(frameStr)_\(lensStr)_\(yawStr)\(pitchStr).png")
+        group.addTask {
+          try PNGWriter.write(frame: tile.frame, to: url)
+        }
+      }
+      try await group.waitForAll()
     }
   }
 
@@ -169,13 +239,18 @@ struct CLI {
                                   3 = three tiles (±60°/0° yaw, 90° FOV, 1024px)
                                 Default: 3 (no edge loss, NMS overlap)
 
-      Examples:
-        # raw lenses only
-        bike360-cli extract Resources/test_video_insv.mp4 100
+        batch <video> <start> <count> [options]
 
-        # multi-tile pipeline (recommended)
-        bike360-cli extract Resources/test_video_insv.mp4 100 \\
-          --preprocess --undistort --tiles 3
+          Run the full pipeline on a range of frames, saving only the
+          final tiles (no raw/preprocessed dumps) for batch inspection.
+          Same projection / --tiles / --preprocess flags as extract.
+
+          Files named: NNNNNN_<lens>_yaw±N[_pitch±N].png (zero-padded
+          so they sort lexicographically).
+
+      Examples:
+        bike360-cli extract Resources/test_video_insv.mp4 100 --preprocess --undistort
+        bike360-cli batch Resources/test_video_insv.mp4 13000 1000 --preprocess
       """
     )
   }
@@ -189,6 +264,24 @@ struct ExtractOptions {
   var undistort: Bool = false
   var mosaic: Bool = false
   var undistortSettings: UndistortingModule.Settings = .threeTilesPerLens
+}
+
+struct BatchOptions {
+  var videoPath: String
+  var startFrame: Int
+  var count: Int
+  var outputDir: String = "./out/batch"
+  var preprocess: Bool = false
+  var undistortSettings: UndistortingModule.Settings = .threeTilesPerLens
+}
+
+extension UndistortingModule.Settings {
+  var tileCount: Int {
+    switch projection {
+    case .rectilinear(let tiles): return tiles.count
+    case .equirectangular, .stereographic: return 1
+    }
+  }
 }
 
 enum CLIError: Error, CustomStringConvertible {
@@ -212,6 +305,7 @@ enum ArgParser {
   enum ParseResult {
     case help
     case extract(ExtractOptions)
+    case batch(BatchOptions)
   }
 
   static func parse(_ args: [String]) throws -> ParseResult {
@@ -220,6 +314,8 @@ enum ArgParser {
     switch command {
     case "-h", "--help", "help":
       return .help
+    case "batch":
+      return try parseBatch(args)
     case "extract":
       guard args.count >= 3 else { throw CLIError.missingArgument("video path") }
       guard args.count >= 4 else { throw CLIError.missingArgument("frame index") }
@@ -273,6 +369,41 @@ enum ArgParser {
     default:
       throw CLIError.unknownCommand(command)
     }
+  }
+
+  static func parseBatch(_ args: [String]) throws -> ParseResult {
+    guard args.count >= 3 else { throw CLIError.missingArgument("video path") }
+    guard args.count >= 4 else { throw CLIError.missingArgument("start frame") }
+    guard args.count >= 5 else { throw CLIError.missingArgument("count") }
+    guard let start = Int(args[3]) else { throw CLIError.invalidValue(name: "start", value: args[3]) }
+    guard let count = Int(args[4]) else { throw CLIError.invalidValue(name: "count", value: args[4]) }
+
+    var options = BatchOptions(videoPath: args[2], startFrame: start, count: count)
+    var i = 5
+    while i < args.count {
+      switch args[i] {
+      case "--output-dir":
+        guard i + 1 < args.count else { throw CLIError.missingArgument("--output-dir value") }
+        options.outputDir = args[i + 1]
+        i += 2
+      case "--preprocess":
+        options.preprocess = true
+        i += 1
+      case "--projection":
+        guard i + 1 < args.count else { throw CLIError.missingArgument("--projection value") }
+        options.undistortSettings = try makeProjectionSettings(name: args[i + 1])
+        i += 2
+      case "--tiles":
+        guard i + 1 < args.count, let value = Int(args[i + 1]) else {
+          throw CLIError.invalidValue(name: "--tiles", value: args[safe: i + 1] ?? "")
+        }
+        options.undistortSettings = try makeTileSettings(count: value)
+        i += 2
+      default:
+        throw CLIError.unknownCommand(args[i])
+      }
+    }
+    return .batch(options)
   }
 
   static func makeTileSettings(count: Int) throws -> UndistortingModule.Settings {
