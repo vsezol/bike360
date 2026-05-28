@@ -92,13 +92,8 @@ struct CLI {
 
       if let yolo {
         let detections = try await runYoloParallel(yolo: yolo, tiles: tiled.tiles)
-        try await writeBatchTilesWithOverlays(
-          tiles: tiled.tiles,
-          detections: detections,
-          config: yolo.config,
-          frameIndex: Int(currentIndex),
-          to: outputURL
-        )
+
+        var trackedForOverlay: [TrackedObject]? = nil
 
         if let fusion {
           let fusionInput = SpatialFusionInput(
@@ -115,11 +110,21 @@ struct CLI {
               frameNumber: currentIndex
             )
             let tracked = try await tracker.process(trackingInput)
+            trackedForOverlay = tracked
             try writeTrackedObjectsJSON(tracked, frame: Int(currentIndex), to: outputURL)
           } else {
             try writeWorldDetectionsJSON(worldDetections, frame: Int(currentIndex), to: outputURL)
           }
         }
+
+        try await writeBatchTilesWithOverlays(
+          tiles: tiled.tiles,
+          detections: detections,
+          tracked: trackedForOverlay,
+          config: yolo.config,
+          frameIndex: Int(currentIndex),
+          to: outputURL
+        )
       } else {
         try await writeBatchTiles(tiled.tiles, frameIndex: Int(currentIndex), to: outputURL)
       }
@@ -141,12 +146,15 @@ struct CLI {
                  processed, total, Double(processed) / total, processed * (options.undistortSettings.tileCount * 2)))
   }
 
-  // Same naming scheme as writeBatchTiles, but each tile gets bboxes from
-  // its corresponding detections drawn on top. Always writes, even if no
-  // detections — important for stable ffmpeg compose down the line.
+  // Same naming scheme as writeBatchTiles. If `tracked` is provided, each
+  // detection is matched to its closest tracked object (in bike-frame polar
+  // distance) so the overlay can show the stable trackId and smoothed
+  // class instead of the raw per-frame YOLO label. Always writes, even
+  // when empty — important for stable ffmpeg compose.
   static func writeBatchTilesWithOverlays(
     tiles: [Tile],
     detections: [Detection],
+    tracked: [TrackedObject]?,
     config: DetectionConfig,
     frameIndex: Int,
     to dir: URL
@@ -164,14 +172,79 @@ struct CLI {
         let url = dir.appendingPathComponent(
           "\(frameStr)_\(tile.lens.rawValue)_\(yawStr)\(pitchStr).png"
         )
+        // Tracking-aware label per detection (or nil if no tracker).
+        let labels: [Detection: TrackingLabelInfo]? = tracked.map { tracked in
+          var labels: [Detection: TrackingLabelInfo] = [:]
+          for detection in tileDetections {
+            labels[detection] = closestTrack(for: detection, in: tracked)
+          }
+          return labels
+        }
         group.addTask {
           try DetectionOverlayWriter.write(
-            tile: tile, detections: tileDetections, config: config, to: url
+            tile: tile,
+            detections: tileDetections,
+            trackingLabels: labels,
+            config: config,
+            to: url
           )
         }
       }
       try await group.waitForAll()
     }
+  }
+
+  // For each Detection, lift to bike frame (same transform SpatialFusion
+  // uses) and find the TrackedObject with the smallest polar cost. If
+  // anything is within reach, hand back its stable trackId + smoothed
+  // class so the overlay shows the tracker's view of the world.
+  static func closestTrack(
+    for detection: Detection,
+    in tracked: [TrackedObject]
+  ) -> TrackingLabelInfo? {
+    let lensOffset: Float = detection.lens == .front ? 0 : 180
+    let yawInBike = wrapYaw(detection.yawInLensDegrees + lensOffset)
+    let pitchInBike = detection.pitchInLensDegrees
+
+    var bestCost = Float.infinity
+    var best: TrackedObject?
+    for t in tracked {
+      let angular = angularDistanceDegrees(
+        yaw1: yawInBike, pitch1: pitchInBike,
+        yaw2: t.yawInBikeDegrees, pitch2: t.pitchInBikeDegrees
+      )
+      let distRatio = abs(detection.estimatedDistanceMeters - t.estimatedDistanceMeters)
+        / max(detection.estimatedDistanceMeters, t.estimatedDistanceMeters, 0.01)
+      let cost = angular + 50 * distRatio
+      if cost < bestCost {
+        bestCost = cost
+        best = t
+      }
+    }
+    guard let track = best, bestCost <= 15 else { return nil }
+    return TrackingLabelInfo(
+      trackId: track.trackId,
+      smoothedClass: track.classLabel,
+      smoothedConfidence: track.classConfidence
+    )
+  }
+
+  static func wrapYaw(_ yaw: Float) -> Float {
+    var y = yaw.truncatingRemainder(dividingBy: 360)
+    if y > 180 { y -= 360 }
+    if y <= -180 { y += 360 }
+    return y
+  }
+
+  static func angularDistanceDegrees(yaw1: Float, pitch1: Float, yaw2: Float, pitch2: Float) -> Float {
+    let yaw1Rad = yaw1 * .pi / 180
+    let yaw2Rad = yaw2 * .pi / 180
+    let pitch1Rad = pitch1 * .pi / 180
+    let pitch2Rad = pitch2 * .pi / 180
+    let v1 = (cos(pitch1Rad) * sin(yaw1Rad), sin(pitch1Rad), cos(pitch1Rad) * cos(yaw1Rad))
+    let v2 = (cos(pitch2Rad) * sin(yaw2Rad), sin(pitch2Rad), cos(pitch2Rad) * cos(yaw2Rad))
+    let dot = max(-1.0, min(1.0, v1.0 * v2.0 + v1.1 * v2.1 + v1.2 * v2.2))
+    return acos(dot) * 180.0 / .pi
   }
 
   static func writeBatchTiles(_ tiles: [Tile], frameIndex: Int, to dir: URL) async throws {
@@ -281,7 +354,7 @@ struct CLI {
       print("  detected \(detections.count) objects in \(elapsed(since: t2))s")
       try writeDetectionsJSON(detections, frame: frame, to: outputDir)
       try writeDetectionOverlays(
-        tiles: tiled.tiles, detections: detections,
+        tiles: tiled.tiles, detections: detections, tracked: nil,
         config: yolo.config, frame: frame, to: outputDir
       )
       printDetectionsSummary(detections)
@@ -340,6 +413,7 @@ struct CLI {
   static func writeDetectionOverlays(
     tiles: [Tile],
     detections: [Detection],
+    tracked: [TrackedObject]?,
     config: DetectionConfig,
     frame: Int,
     to dir: URL
@@ -352,12 +426,22 @@ struct CLI {
       }
       if tileDetections.isEmpty { continue }
 
+      let labels: [Detection: TrackingLabelInfo]? = tracked.map { tracked in
+        var labels: [Detection: TrackingLabelInfo] = [:]
+        for detection in tileDetections {
+          labels[detection] = closestTrack(for: detection, in: tracked)
+        }
+        return labels
+      }
+
       let yawStr = signedTag("yaw", Int(tile.yawDegrees))
       let pitchStr = tile.pitchDegrees == 0 ? "" : "_" + signedTag("pitch", Int(tile.pitchDegrees))
       let url = dir.appendingPathComponent(
         "\(tile.lens.rawValue)_\(frame)_tile_\(yawStr)\(pitchStr)_detected.png"
       )
-      try DetectionOverlayWriter.write(tile: tile, detections: tileDetections, config: config, to: url)
+      try DetectionOverlayWriter.write(
+        tile: tile, detections: tileDetections, trackingLabels: labels, config: config, to: url
+      )
     }
     print("    overlay PNGs written")
   }
@@ -870,6 +954,15 @@ struct DetectionDTO: Encodable {
 
 // Draws bbox + class label + distance on top of a tile's pixel buffer and
 // writes the result as a PNG, so a human can verify detections at a glance.
+// Per-detection annotation produced by tracking-aware overlay. Carries
+// the stable trackId + smoothed class so the picture stops jittering
+// frame-to-frame.
+struct TrackingLabelInfo {
+  let trackId: UInt64
+  let smoothedClass: String
+  let smoothedConfidence: Float
+}
+
 enum DetectionOverlayWriter {
   nonisolated(unsafe) private static let ciContext = CIContext()
   private static let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
@@ -889,7 +982,28 @@ enum DetectionOverlayWriter {
     }
   }
 
-  static func write(tile: Tile, detections: [Detection], config: DetectionConfig, to url: URL) throws {
+  // Distinct colour per trackId so the same object keeps the same colour
+  // across the whole video. Cheap deterministic hash spread across 12
+  // saturated hues — visually distinguishable even when 20+ tracks
+  // share a frame.
+  private static func cgColor(forTrackId id: UInt64) -> CGColor {
+    let hues: [(Double, Double, Double)] = [
+      (1.00, 0.30, 0.30), (0.30, 0.90, 0.30), (0.30, 0.50, 1.00),
+      (1.00, 0.65, 0.10), (1.00, 1.00, 0.30), (0.30, 0.90, 1.00),
+      (1.00, 0.30, 0.90), (0.60, 1.00, 0.30), (0.30, 0.30, 1.00),
+      (1.00, 0.50, 0.50), (0.50, 1.00, 0.80), (1.00, 0.80, 0.40),
+    ]
+    let (r, g, b) = hues[Int(id % UInt64(hues.count))]
+    return CGColor(red: r, green: g, blue: b, alpha: 1)
+  }
+
+  static func write(
+    tile: Tile,
+    detections: [Detection],
+    trackingLabels: [Detection: TrackingLabelInfo]? = nil,
+    config: DetectionConfig,
+    to url: URL
+  ) throws {
     let frame = tile.frame
     let width = frame.width
     let height = frame.height
@@ -924,13 +1038,25 @@ enum DetectionOverlayWriter {
         width: detection.bbox.width * CGFloat(width),
         height: detection.bbox.height * CGFloat(height)
       )
-      let colorName = config.info(for: detection.classLabel)?.colorName ?? "white"
-      let color = Self.cgColor(named: colorName)
+
+      let trackInfo = trackingLabels?[detection]
+      let displayClass = trackInfo?.smoothedClass ?? detection.classLabel
+      let color: CGColor
+      let label: String
+      if let info = trackInfo {
+        color = Self.cgColor(forTrackId: info.trackId)
+        label = String(
+          format: "#%llu %@ %.1fm",
+          info.trackId, displayClass, detection.estimatedDistanceMeters
+        )
+      } else {
+        let colorName = config.info(for: displayClass)?.colorName ?? "white"
+        color = Self.cgColor(named: colorName)
+        label = String(format: "%@ %.1fm", displayClass, detection.estimatedDistanceMeters)
+      }
       context.setStrokeColor(color)
       context.setLineWidth(4)
       context.stroke(pxBbox)
-
-      let label = String(format: "%@ %.1fm", detection.classLabel, detection.estimatedDistanceMeters)
       drawText(label, at: CGPoint(x: pxBbox.minX, y: pxBbox.maxY + 4),
                color: color, fontSize: 22, in: context, imageHeight: height)
     }
