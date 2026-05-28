@@ -60,6 +60,9 @@ struct CLI {
       yolo = nil
     }
 
+    let fusion = options.fuse ? SpatialFusionModule() : nil
+    let tracker = options.track ? TrackingModule() : nil
+
     let startIndex = UInt64(options.startFrame)
     let endIndex = startIndex + UInt64(options.count)
     var currentIndex: UInt64 = 0
@@ -70,6 +73,8 @@ struct CLI {
     print("Output: \(outputURL.path)")
     print("Tiles per frame: \(options.undistortSettings.tileCount * 2) (\(options.undistortSettings.tileCount) per lens × 2 lenses)")
     if options.detect { print("Mode: tile + YOLO overlay") }
+    if options.fuse { print("Mode: + spatial fusion (Polar NMS)") }
+    if options.track { print("Mode: + ByteTrack temporal tracking") }
     print()
 
     for try await stereo in source.frames() {
@@ -94,6 +99,27 @@ struct CLI {
           frameIndex: Int(currentIndex),
           to: outputURL
         )
+
+        if let fusion {
+          let fusionInput = SpatialFusionInput(
+            detections: detections,
+            helmetOrientation: .zero(),
+            bikeOrientation: .zero()
+          )
+          let worldDetections = try await fusion.process(fusionInput)
+
+          if let tracker {
+            let trackingInput = TrackingInput(
+              detections: worldDetections,
+              frameTimestamp: stereo.captureTimestamp,
+              frameNumber: currentIndex
+            )
+            let tracked = try await tracker.process(trackingInput)
+            try writeTrackedObjectsJSON(tracked, frame: Int(currentIndex), to: outputURL)
+          } else {
+            try writeWorldDetectionsJSON(worldDetections, frame: Int(currentIndex), to: outputURL)
+          }
+        }
       } else {
         try await writeBatchTiles(tiled.tiles, frameIndex: Int(currentIndex), to: outputURL)
       }
@@ -259,6 +285,55 @@ struct CLI {
         config: yolo.config, frame: frame, to: outputDir
       )
       printDetectionsSummary(detections)
+
+      if options.fuse {
+        let t3 = Date()
+        let fusion = SpatialFusionModule()
+        let fusionInput = SpatialFusionInput(
+          detections: detections,
+          helmetOrientation: .zero(),
+          bikeOrientation: .zero()
+        )
+        let worldDetections = try await fusion.process(fusionInput)
+        print("  fused \(detections.count) raw -> \(worldDetections.count) world detections in \(elapsed(since: t3))s")
+        try writeWorldDetectionsJSON(worldDetections, frame: frame, to: outputDir)
+        printWorldDetectionsSummary(worldDetections)
+      }
+    }
+  }
+
+  static func writeWorldDetectionsJSON(_ detections: [WorldDetection], frame: Int, to dir: URL) throws {
+    let payload = WorldDetectionsPayload(
+      frame: frame,
+      detections: detections.map(WorldDetectionDTO.init)
+    )
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(payload)
+    let url = dir.appendingPathComponent(String(format: "frame_%06d_world_detections.json", frame))
+    try data.write(to: url)
+    print("    world detections JSON: \(url.lastPathComponent)")
+  }
+
+  static func writeTrackedObjectsJSON(_ tracked: [TrackedObject], frame: Int, to dir: URL) throws {
+    let payload = TrackedObjectsPayload(
+      frame: frame,
+      objects: tracked.map(TrackedObjectDTO.init)
+    )
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(payload)
+    let url = dir.appendingPathComponent(String(format: "frame_%06d_tracked.json", frame))
+    try data.write(to: url)
+  }
+
+  static func printWorldDetectionsSummary(_ detections: [WorldDetection]) {
+    let byClass = Dictionary(grouping: detections, by: { $0.classLabel })
+    for (cls, items) in byClass.sorted(by: { $0.key < $1.key }) {
+      let closest = items.map { $0.estimatedDistanceMeters }.min() ?? 0
+      let merges = items.map { $0.mergedDetectionCount }.reduce(0, +)
+      let name = cls.padding(toLength: 15, withPad: " ", startingAt: 0)
+      print("    \(name) \(items.count) objects (\(merges) raw)  closest \(String(format: "%.1f", closest))m")
     }
   }
 
@@ -423,6 +498,7 @@ struct ExtractOptions {
   var undistort: Bool = false
   var mosaic: Bool = false
   var detect: Bool = false
+  var fuse: Bool = false
   var modelPath: String = "Resources/Models/yolo11n.mlpackage"
   var classesConfigPath: String = "Resources/Config/detection-classes.json"
   var undistortSettings: UndistortingModule.Settings = .threeTilesPerLens
@@ -435,6 +511,8 @@ struct BatchOptions {
   var outputDir: String = "./out/batch"
   var preprocess: Bool = false
   var detect: Bool = false
+  var fuse: Bool = false
+  var track: Bool = false
   var modelPath: String = "Resources/Models/yolo11n.mlpackage"
   var classesConfigPath: String = "Resources/Config/detection-classes.json"
   var undistortSettings: UndistortingModule.Settings = .threeTilesPerLens
@@ -507,6 +585,9 @@ enum ArgParser {
         case "--detect":
           options.detect = true
           i += 1
+        case "--fuse":
+          options.fuse = true
+          i += 1
         case "--model":
           guard i + 1 < args.count else { throw CLIError.missingArgument("--model value") }
           options.modelPath = args[i + 1]
@@ -572,6 +653,15 @@ enum ArgParser {
         options.undistortSettings = try makeTileSettings(count: value)
         i += 2
       case "--detect":
+        options.detect = true
+        i += 1
+      case "--fuse":
+        options.fuse = true
+        options.detect = true  // implied
+        i += 1
+      case "--track":
+        options.track = true
+        options.fuse = true
         options.detect = true
         i += 1
       case "--model":
@@ -684,6 +774,62 @@ extension Array {
 struct DetectionsPayload: Encodable {
   let frame: Int
   let detections: [DetectionDTO]
+}
+
+struct TrackedObjectsPayload: Encodable {
+  let frame: Int
+  let objects: [TrackedObjectDTO]
+}
+
+struct TrackedObjectDTO: Encodable {
+  let trackId: UInt64
+  let classLabel: String
+  let classConfidence: Float
+  let yawInBikeDegrees: Float
+  let pitchInBikeDegrees: Float
+  let estimatedDistanceMeters: Float
+  let angularVelocityDegPerSec: Float
+  let radialVelocityMetersPerSec: Float
+  let ageFrames: Int
+  let isReliable: Bool
+
+  init(_ t: TrackedObject) {
+    self.trackId = t.trackId
+    self.classLabel = t.classLabel
+    self.classConfidence = t.classConfidence
+    self.yawInBikeDegrees = t.yawInBikeDegrees
+    self.pitchInBikeDegrees = t.pitchInBikeDegrees
+    self.estimatedDistanceMeters = t.estimatedDistanceMeters
+    self.angularVelocityDegPerSec = t.angularVelocityDegPerSec
+    self.radialVelocityMetersPerSec = t.radialVelocityMetersPerSec
+    self.ageFrames = t.ageFrames
+    self.isReliable = t.isReliable
+  }
+}
+
+struct WorldDetectionsPayload: Encodable {
+  let frame: Int
+  let detections: [WorldDetectionDTO]
+}
+
+struct WorldDetectionDTO: Encodable {
+  let classLabel: String
+  let confidence: Float
+  let yawInBikeDegrees: Float
+  let pitchInBikeDegrees: Float
+  let estimatedDistanceMeters: Float
+  let contributingLenses: [String]
+  let mergedDetectionCount: Int
+
+  init(_ d: WorldDetection) {
+    self.classLabel = d.classLabel
+    self.confidence = d.confidence
+    self.yawInBikeDegrees = d.yawInBikeDegrees
+    self.pitchInBikeDegrees = d.pitchInBikeDegrees
+    self.estimatedDistanceMeters = d.estimatedDistanceMeters
+    self.contributingLenses = d.contributingLenses.map { $0.rawValue }.sorted()
+    self.mergedDetectionCount = d.mergedDetectionCount
+  }
 }
 
 struct DetectionDTO: Encodable {
