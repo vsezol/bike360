@@ -1,6 +1,8 @@
 import CoreGraphics
 import CoreImage
 import CoreMedia
+import CoreML
+import CoreText
 import Foundation
 import ImageIO
 import Pipeline
@@ -9,12 +11,19 @@ import UniformTypeIdentifiers
 @main
 struct CLI {
   static func main() async {
+    setbuf(stdout, nil)  // unbuffered stdout — critical for diagnosing crashes
     do {
       try await run()
     } catch {
       FileHandle.standardError.write(Data("Error: \(error)\n".utf8))
       exit(1)
     }
+    // Workaround: VNCoreMLModel / Vision deinit currently crashes on
+    // macOS Command Line Tools after a successful inference. All work
+    // (JSON, PNG, summary) is already flushed by this point, so we force
+    // a clean exit instead of letting Swift run shutdown that segfaults.
+    // This will go away once we move to a real Xcode-built iOS target.
+    exit(0)
   }
 
   static func run() async throws {
@@ -111,6 +120,14 @@ struct CLI {
     } else {
       undistorting = nil
     }
+    let yolo: YoloModule?
+    if options.detect {
+      print("Loading YOLO model from \(options.modelPath)...")
+      yolo = try YoloModule(modelURL: URL(fileURLWithPath: options.modelPath))
+      print("YOLO model loaded.")
+    } else {
+      yolo = nil
+    }
 
     let started = Date()
     var currentIndex: UInt64 = 0
@@ -124,6 +141,7 @@ struct CLI {
           outputDir: outputURL,
           preprocessing: preprocessing,
           undistorting: undistorting,
+          yolo: yolo,
           startedAt: started
         )
         return
@@ -139,6 +157,7 @@ struct CLI {
     outputDir: URL,
     preprocessing: PreprocessingModule?,
     undistorting: UndistortingModule?,
+    yolo: YoloModule?,
     startedAt: Date
   ) async throws {
     let frame = options.frameIndex
@@ -167,6 +186,73 @@ struct CLI {
     try writeTiles(tiled.tiles, frame: frame, to: outputDir)
     if options.mosaic {
       try writeMosaics(tiled.tiles, frame: frame, to: outputDir)
+    }
+
+    if let yolo {
+      let t2 = Date()
+      let detections = try await runYoloParallel(yolo: yolo, tiles: tiled.tiles)
+      print("  detected \(detections.count) objects in \(elapsed(since: t2))s")
+      try writeDetectionsJSON(detections, frame: frame, to: outputDir)
+      try writeDetectionOverlays(tiles: tiled.tiles, detections: detections, frame: frame, to: outputDir)
+      printDetectionsSummary(detections)
+    }
+  }
+
+  static func writeDetectionOverlays(
+    tiles: [Tile],
+    detections: [Detection],
+    frame: Int,
+    to dir: URL
+  ) throws {
+    for tile in tiles {
+      let tileDetections = detections.filter {
+        $0.lens == tile.lens
+          && $0.sourceTileYawDegrees == tile.yawDegrees
+          && $0.sourceTilePitchDegrees == tile.pitchDegrees
+      }
+      if tileDetections.isEmpty { continue }
+
+      let yawStr = signedTag("yaw", Int(tile.yawDegrees))
+      let pitchStr = tile.pitchDegrees == 0 ? "" : "_" + signedTag("pitch", Int(tile.pitchDegrees))
+      let url = dir.appendingPathComponent(
+        "\(tile.lens.rawValue)_\(frame)_tile_\(yawStr)\(pitchStr)_detected.png"
+      )
+      try DetectionOverlayWriter.write(tile: tile, detections: tileDetections, to: url)
+    }
+    print("    overlay PNGs written")
+  }
+
+  static func runYoloParallel(yolo: YoloModule, tiles: [Tile]) async throws -> [Detection] {
+    try await withThrowingTaskGroup(of: [Detection].self) { group in
+      for tile in tiles {
+        group.addTask {
+          try await yolo.process(tile)
+        }
+      }
+      var collected: [Detection] = []
+      for try await batch in group {
+        collected.append(contentsOf: batch)
+      }
+      return collected
+    }
+  }
+
+  static func writeDetectionsJSON(_ detections: [Detection], frame: Int, to dir: URL) throws {
+    let payload = DetectionsPayload(frame: frame, detections: detections.map(DetectionDTO.init))
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(payload)
+    let url = dir.appendingPathComponent(String(format: "frame_%06d_detections.json", frame))
+    try data.write(to: url)
+    print("    detections JSON: \(url.lastPathComponent)")
+  }
+
+  static func printDetectionsSummary(_ detections: [Detection]) {
+    let byClass = Dictionary(grouping: detections, by: { $0.objectClass })
+    for (cls, items) in byClass.sorted(by: { $0.key.rawValue < $1.key.rawValue }) {
+      let closest = items.map { $0.estimatedDistanceMeters }.min() ?? 0
+      let name = cls.rawValue.padding(toLength: 15, withPad: " ", startingAt: 0)
+      print("    \(name) \(items.count)  closest \(String(format: "%.1f", closest))m")
     }
   }
 
@@ -263,6 +349,8 @@ struct ExtractOptions {
   var preprocess: Bool = false
   var undistort: Bool = false
   var mosaic: Bool = false
+  var detect: Bool = false
+  var modelPath: String = "Resources/Models/yolo11n.mlpackage"
   var undistortSettings: UndistortingModule.Settings = .threeTilesPerLens
 }
 
@@ -339,6 +427,13 @@ enum ArgParser {
         case "--mosaic":
           options.mosaic = true
           i += 1
+        case "--detect":
+          options.detect = true
+          i += 1
+        case "--model":
+          guard i + 1 < args.count else { throw CLIError.missingArgument("--model value") }
+          options.modelPath = args[i + 1]
+          i += 2
         case "--projection":
           guard i + 1 < args.count else { throw CLIError.missingArgument("--projection value") }
           options.undistortSettings = try makeProjectionSettings(name: args[i + 1])
@@ -494,6 +589,164 @@ enum ArgParser {
 extension Array {
   subscript(safe index: Int) -> Element? {
     indices.contains(index) ? self[index] : nil
+  }
+}
+
+// JSON DTOs for detections.
+struct DetectionsPayload: Encodable {
+  let frame: Int
+  let detections: [DetectionDTO]
+}
+
+struct DetectionDTO: Encodable {
+  let objectClass: String
+  let confidence: Float
+  let bbox: BboxDTO
+  let yawInLensDegrees: Float
+  let pitchInLensDegrees: Float
+  let estimatedDistanceMeters: Float
+  let lens: String
+  let sourceTileYawDegrees: Float
+  let sourceTilePitchDegrees: Float
+
+  struct BboxDTO: Encodable {
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+  }
+
+  init(_ d: Detection) {
+    self.objectClass = d.objectClass.rawValue
+    self.confidence = d.confidence
+    self.bbox = BboxDTO(
+      x: Double(d.bbox.minX),
+      y: Double(d.bbox.minY),
+      width: Double(d.bbox.width),
+      height: Double(d.bbox.height)
+    )
+    self.yawInLensDegrees = d.yawInLensDegrees
+    self.pitchInLensDegrees = d.pitchInLensDegrees
+    self.estimatedDistanceMeters = d.estimatedDistanceMeters
+    self.lens = d.lens.rawValue
+    self.sourceTileYawDegrees = d.sourceTileYawDegrees
+    self.sourceTilePitchDegrees = d.sourceTilePitchDegrees
+  }
+}
+
+// Draws bbox + class label + distance on top of a tile's pixel buffer and
+// writes the result as a PNG, so a human can verify detections at a glance.
+enum DetectionOverlayWriter {
+  nonisolated(unsafe) private static let ciContext = CIContext()
+  private static let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+
+  // Colors per class — kept saturated so they pop against road footage.
+  private static func color(for cls: DetectionClass) -> CGColor {
+    switch cls {
+    case .car: return CGColor(red: 0.20, green: 0.85, blue: 0.20, alpha: 1)
+    case .truck, .bus: return CGColor(red: 0.20, green: 0.50, blue: 1.00, alpha: 1)
+    case .person: return CGColor(red: 1.00, green: 0.25, blue: 0.25, alpha: 1)
+    case .motorcycle, .bicycle: return CGColor(red: 1.00, green: 0.60, blue: 0.10, alpha: 1)
+    case .trafficLight: return CGColor(red: 1.00, green: 1.00, blue: 0.30, alpha: 1)
+    case .stopSign: return CGColor(red: 1.00, green: 0.10, blue: 0.10, alpha: 1)
+    }
+  }
+
+  static func write(tile: Tile, detections: [Detection], to url: URL) throws {
+    let frame = tile.frame
+    let width = frame.width
+    let height = frame.height
+
+    guard let context = CGContext(
+      data: nil,
+      width: width,
+      height: height,
+      bitsPerComponent: 8,
+      bytesPerRow: 4 * width,
+      space: colorSpace,
+      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else {
+      throw CLIError.invalidValue(name: "overlay", value: "CGContext creation failed")
+    }
+
+    // 1) draw the tile background
+    let ciImage = CIImage(cvPixelBuffer: frame.pixelBuffer)
+    guard let cgBackground = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
+      throw CLIError.invalidValue(name: "overlay", value: "createCGImage failed")
+    }
+    context.draw(cgBackground, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+    // CGContext has bottom-left origin; our bbox.y is top-down. Flip vertically.
+    context.translateBy(x: 0, y: CGFloat(height))
+    context.scaleBy(x: 1, y: -1)
+
+    for detection in detections {
+      let pxBbox = CGRect(
+        x: detection.bbox.minX * CGFloat(width),
+        y: detection.bbox.minY * CGFloat(height),
+        width: detection.bbox.width * CGFloat(width),
+        height: detection.bbox.height * CGFloat(height)
+      )
+      let color = self.color(for: detection.objectClass)
+      context.setStrokeColor(color)
+      context.setLineWidth(4)
+      context.stroke(pxBbox)
+
+      let label = String(format: "%@ %.1fm", detection.objectClass.rawValue, detection.estimatedDistanceMeters)
+      drawText(label, at: CGPoint(x: pxBbox.minX, y: pxBbox.maxY + 4),
+               color: color, fontSize: 22, in: context, imageHeight: height)
+    }
+
+    guard let cgImage = context.makeImage() else {
+      throw CLIError.invalidValue(name: "overlay", value: "context.makeImage() failed")
+    }
+    guard let dest = CGImageDestinationCreateWithURL(
+      url as CFURL, UTType.png.identifier as CFString, 1, nil
+    ) else {
+      throw CLIError.invalidValue(name: "overlay", value: "CGImageDestinationCreateWithURL failed")
+    }
+    CGImageDestinationAddImage(dest, cgImage, nil)
+    guard CGImageDestinationFinalize(dest) else {
+      throw CLIError.invalidValue(name: "overlay", value: "CGImageDestinationFinalize failed")
+    }
+  }
+
+  // Draw text with a dark background box for readability. CoreText is the
+  // simplest cross-platform-Apple option that doesn't pull in UIKit/AppKit.
+  private static func drawText(
+    _ string: String,
+    at point: CGPoint,
+    color: CGColor,
+    fontSize: CGFloat,
+    in context: CGContext,
+    imageHeight: Int
+  ) {
+    let font = CTFontCreateWithName("Helvetica-Bold" as CFString, fontSize, nil)
+    let attrs: [CFString: Any] = [
+      kCTFontAttributeName: font,
+      kCTForegroundColorAttributeName: color,
+    ]
+    guard let attrString = CFAttributedStringCreate(nil, string as CFString, attrs as CFDictionary)
+    else { return }
+    let line = CTLineCreateWithAttributedString(attrString)
+    let bounds = CTLineGetBoundsWithOptions(line, [])
+
+    // Flip back to top-left for text positioning, then back to bottom-left
+    // after drawing. Working in the flipped frame is just easier here.
+    context.saveGState()
+    // We are in top-down logical space (already flipped above). CoreText
+    // draws bottom-up, so flip locally for this text only.
+    context.translateBy(x: point.x, y: point.y + bounds.height)
+    context.scaleBy(x: 1, y: -1)
+
+    // Dark background pill
+    let pad: CGFloat = 4
+    context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 0.7))
+    context.fill(CGRect(x: -pad, y: -pad, width: bounds.width + 2 * pad, height: bounds.height + 2 * pad))
+
+    context.textPosition = CGPoint(x: 0, y: 0)
+    CTLineDraw(line, context)
+    context.restoreGState()
   }
 }
 

@@ -28,5 +28,12 @@ Resources/
 # Generated test outputs
 out/
 
+# ML models (downloaded/exported separately, can be regenerated)
+Resources/Models/*.mlpackage
+Resources/Models/*.mlmodelc
+Resources/Models/*.mlmodel
+Resources/Models/*.pt
+Resources/Models/*.onnx
+
 # Internal docs (planning notes, posts, diagrams — not for public repo)
 internal-docs/
