@@ -8,12 +8,15 @@ import Foundation
 //    Stage 3 will combine this with helmet and bike gyro to place the
 //    object in bike-frame world coordinates.
 //
-//  - Estimated distance in meters, from the class' known real-world height
-//    and the bbox height in pixels.
+//  - Estimated distance in meters, from the class' configured real-world
+//    height and the bbox height in pixels.
 //
 //  - Source tile metadata for traceability and cross-tile NMS.
 public struct Detection: Sendable, Hashable {
-  public let objectClass: DetectionClass
+  // YOLO label string (e.g. "car", "person"). Already lowercased and
+  // pre-filtered against DetectionConfig — anything here is a class we
+  // care about.
+  public let classLabel: String
   public let confidence: Float
   // Normalized bbox in tile coords. (0,0) top-left, (1,1) bottom-right.
   public let bbox: CGRect
@@ -31,7 +34,7 @@ public struct Detection: Sendable, Hashable {
   public let sourceTilePitchDegrees: Float
 
   public init(
-    objectClass: DetectionClass,
+    classLabel: String,
     confidence: Float,
     bbox: CGRect,
     yawInLensDegrees: Float,
@@ -41,7 +44,7 @@ public struct Detection: Sendable, Hashable {
     sourceTileYawDegrees: Float,
     sourceTilePitchDegrees: Float
   ) {
-    self.objectClass = objectClass
+    self.classLabel = classLabel
     self.confidence = confidence
     self.bbox = bbox
     self.yawInLensDegrees = yawInLensDegrees

@@ -48,6 +48,18 @@ struct CLI {
     let metal = try MetalContext()
     let undistorting = try UndistortingModule(context: metal, settings: options.undistortSettings)
 
+    let yolo: YoloModule?
+    if options.detect {
+      print("Loading detection config from \(options.classesConfigPath)...")
+      let config = try loadDetectionConfig(path: options.classesConfigPath)
+      print("Loading YOLO model from \(options.modelPath)...")
+      let settings = YoloModule.Settings(detectionConfig: config)
+      yolo = try YoloModule(modelURL: URL(fileURLWithPath: options.modelPath), settings: settings)
+      print("YOLO model loaded.")
+    } else {
+      yolo = nil
+    }
+
     let startIndex = UInt64(options.startFrame)
     let endIndex = startIndex + UInt64(options.count)
     var currentIndex: UInt64 = 0
@@ -57,6 +69,7 @@ struct CLI {
     print("Batch: \(options.count) frames from \(options.startFrame) to \(options.startFrame + options.count - 1)")
     print("Output: \(outputURL.path)")
     print("Tiles per frame: \(options.undistortSettings.tileCount * 2) (\(options.undistortSettings.tileCount) per lens × 2 lenses)")
+    if options.detect { print("Mode: tile + YOLO overlay") }
     print()
 
     for try await stereo in source.frames() {
@@ -71,7 +84,19 @@ struct CLI {
         current = try await preprocessing.process(current)
       }
       let tiled = try await undistorting.process(current)
-      try await writeBatchTiles(tiled.tiles, frameIndex: Int(currentIndex), to: outputURL)
+
+      if let yolo {
+        let detections = try await runYoloParallel(yolo: yolo, tiles: tiled.tiles)
+        try await writeBatchTilesWithOverlays(
+          tiles: tiled.tiles,
+          detections: detections,
+          config: yolo.config,
+          frameIndex: Int(currentIndex),
+          to: outputURL
+        )
+      } else {
+        try await writeBatchTiles(tiled.tiles, frameIndex: Int(currentIndex), to: outputURL)
+      }
 
       processed += 1
       if processed % 50 == 0 || processed == options.count {
@@ -88,6 +113,39 @@ struct CLI {
     print()
     print(String(format: "Done. %d frames in %.1fs (%.1f fps avg, %d PNGs written)",
                  processed, total, Double(processed) / total, processed * (options.undistortSettings.tileCount * 2)))
+  }
+
+  // Same naming scheme as writeBatchTiles, but each tile gets bboxes from
+  // its corresponding detections drawn on top. Always writes, even if no
+  // detections — important for stable ffmpeg compose down the line.
+  static func writeBatchTilesWithOverlays(
+    tiles: [Tile],
+    detections: [Detection],
+    config: DetectionConfig,
+    frameIndex: Int,
+    to dir: URL
+  ) async throws {
+    let frameStr = String(format: "%06d", frameIndex)
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      for tile in tiles {
+        let tileDetections = detections.filter {
+          $0.lens == tile.lens
+            && $0.sourceTileYawDegrees == tile.yawDegrees
+            && $0.sourceTilePitchDegrees == tile.pitchDegrees
+        }
+        let yawStr = signedTag("yaw", Int(tile.yawDegrees))
+        let pitchStr = tile.pitchDegrees == 0 ? "" : "_" + signedTag("pitch", Int(tile.pitchDegrees))
+        let url = dir.appendingPathComponent(
+          "\(frameStr)_\(tile.lens.rawValue)_\(yawStr)\(pitchStr).png"
+        )
+        group.addTask {
+          try DetectionOverlayWriter.write(
+            tile: tile, detections: tileDetections, config: config, to: url
+          )
+        }
+      }
+      try await group.waitForAll()
+    }
   }
 
   static func writeBatchTiles(_ tiles: [Tile], frameIndex: Int, to dir: URL) async throws {
@@ -122,8 +180,11 @@ struct CLI {
     }
     let yolo: YoloModule?
     if options.detect {
+      print("Loading detection config from \(options.classesConfigPath)...")
+      let config = try loadDetectionConfig(path: options.classesConfigPath)
       print("Loading YOLO model from \(options.modelPath)...")
-      yolo = try YoloModule(modelURL: URL(fileURLWithPath: options.modelPath))
+      let settings = YoloModule.Settings(detectionConfig: config)
+      yolo = try YoloModule(modelURL: URL(fileURLWithPath: options.modelPath), settings: settings)
       print("YOLO model loaded.")
     } else {
       yolo = nil
@@ -193,7 +254,10 @@ struct CLI {
       let detections = try await runYoloParallel(yolo: yolo, tiles: tiled.tiles)
       print("  detected \(detections.count) objects in \(elapsed(since: t2))s")
       try writeDetectionsJSON(detections, frame: frame, to: outputDir)
-      try writeDetectionOverlays(tiles: tiled.tiles, detections: detections, frame: frame, to: outputDir)
+      try writeDetectionOverlays(
+        tiles: tiled.tiles, detections: detections,
+        config: yolo.config, frame: frame, to: outputDir
+      )
       printDetectionsSummary(detections)
     }
   }
@@ -201,6 +265,7 @@ struct CLI {
   static func writeDetectionOverlays(
     tiles: [Tile],
     detections: [Detection],
+    config: DetectionConfig,
     frame: Int,
     to dir: URL
   ) throws {
@@ -217,7 +282,7 @@ struct CLI {
       let url = dir.appendingPathComponent(
         "\(tile.lens.rawValue)_\(frame)_tile_\(yawStr)\(pitchStr)_detected.png"
       )
-      try DetectionOverlayWriter.write(tile: tile, detections: tileDetections, to: url)
+      try DetectionOverlayWriter.write(tile: tile, detections: tileDetections, config: config, to: url)
     }
     print("    overlay PNGs written")
   }
@@ -237,6 +302,17 @@ struct CLI {
     }
   }
 
+  static func loadDetectionConfig(path: String) throws -> DetectionConfig {
+    let url = URL(fileURLWithPath: path)
+    if FileManager.default.fileExists(atPath: url.path) {
+      return try DetectionConfig.load(from: url)
+    }
+    FileHandle.standardError.write(Data(
+      "Warning: detection config not found at \(path); using embedded defaults.\n".utf8
+    ))
+    return .default
+  }
+
   static func writeDetectionsJSON(_ detections: [Detection], frame: Int, to dir: URL) throws {
     let payload = DetectionsPayload(frame: frame, detections: detections.map(DetectionDTO.init))
     let encoder = JSONEncoder()
@@ -248,10 +324,10 @@ struct CLI {
   }
 
   static func printDetectionsSummary(_ detections: [Detection]) {
-    let byClass = Dictionary(grouping: detections, by: { $0.objectClass })
-    for (cls, items) in byClass.sorted(by: { $0.key.rawValue < $1.key.rawValue }) {
+    let byClass = Dictionary(grouping: detections, by: { $0.classLabel })
+    for (cls, items) in byClass.sorted(by: { $0.key < $1.key }) {
       let closest = items.map { $0.estimatedDistanceMeters }.min() ?? 0
-      let name = cls.rawValue.padding(toLength: 15, withPad: " ", startingAt: 0)
+      let name = cls.padding(toLength: 15, withPad: " ", startingAt: 0)
       print("    \(name) \(items.count)  closest \(String(format: "%.1f", closest))m")
     }
   }
@@ -351,6 +427,7 @@ struct ExtractOptions {
   var mosaic: Bool = false
   var detect: Bool = false
   var modelPath: String = "Resources/Models/yolo11n.mlpackage"
+  var classesConfigPath: String = "Resources/Config/detection-classes.json"
   var undistortSettings: UndistortingModule.Settings = .threeTilesPerLens
 }
 
@@ -360,6 +437,9 @@ struct BatchOptions {
   var count: Int
   var outputDir: String = "./out/batch"
   var preprocess: Bool = false
+  var detect: Bool = false
+  var modelPath: String = "Resources/Models/yolo11n.mlpackage"
+  var classesConfigPath: String = "Resources/Config/detection-classes.json"
   var undistortSettings: UndistortingModule.Settings = .threeTilesPerLens
 }
 
@@ -494,6 +574,17 @@ enum ArgParser {
         }
         options.undistortSettings = try makeTileSettings(count: value)
         i += 2
+      case "--detect":
+        options.detect = true
+        i += 1
+      case "--model":
+        guard i + 1 < args.count else { throw CLIError.missingArgument("--model value") }
+        options.modelPath = args[i + 1]
+        i += 2
+      case "--classes-config":
+        guard i + 1 < args.count else { throw CLIError.missingArgument("--classes-config value") }
+        options.classesConfigPath = args[i + 1]
+        i += 2
       default:
         throw CLIError.unknownCommand(args[i])
       }
@@ -599,7 +690,7 @@ struct DetectionsPayload: Encodable {
 }
 
 struct DetectionDTO: Encodable {
-  let objectClass: String
+  let classLabel: String
   let confidence: Float
   let bbox: BboxDTO
   let yawInLensDegrees: Float
@@ -617,7 +708,7 @@ struct DetectionDTO: Encodable {
   }
 
   init(_ d: Detection) {
-    self.objectClass = d.objectClass.rawValue
+    self.classLabel = d.classLabel
     self.confidence = d.confidence
     self.bbox = BboxDTO(
       x: Double(d.bbox.minX),
@@ -640,19 +731,22 @@ enum DetectionOverlayWriter {
   nonisolated(unsafe) private static let ciContext = CIContext()
   private static let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
 
-  // Colors per class — kept saturated so they pop against road footage.
-  private static func color(for cls: DetectionClass) -> CGColor {
-    switch cls {
-    case .car: return CGColor(red: 0.20, green: 0.85, blue: 0.20, alpha: 1)
-    case .truck, .bus: return CGColor(red: 0.20, green: 0.50, blue: 1.00, alpha: 1)
-    case .person: return CGColor(red: 1.00, green: 0.25, blue: 0.25, alpha: 1)
-    case .motorcycle, .bicycle: return CGColor(red: 1.00, green: 0.60, blue: 0.10, alpha: 1)
-    case .trafficLight: return CGColor(red: 1.00, green: 1.00, blue: 0.30, alpha: 1)
-    case .stopSign: return CGColor(red: 1.00, green: 0.10, blue: 0.10, alpha: 1)
+  // Named palette so the JSON config can specify colors without packing
+  // RGB values. Anything unrecognized falls back to white.
+  private static func cgColor(named name: String) -> CGColor {
+    switch name.lowercased() {
+    case "red":    return CGColor(red: 1.00, green: 0.25, blue: 0.25, alpha: 1)
+    case "green":  return CGColor(red: 0.20, green: 0.85, blue: 0.20, alpha: 1)
+    case "blue":   return CGColor(red: 0.20, green: 0.50, blue: 1.00, alpha: 1)
+    case "orange": return CGColor(red: 1.00, green: 0.60, blue: 0.10, alpha: 1)
+    case "yellow": return CGColor(red: 1.00, green: 1.00, blue: 0.30, alpha: 1)
+    case "cyan":   return CGColor(red: 0.20, green: 0.85, blue: 1.00, alpha: 1)
+    case "magenta": return CGColor(red: 1.00, green: 0.30, blue: 0.80, alpha: 1)
+    default:       return CGColor(red: 1.00, green: 1.00, blue: 1.00, alpha: 1)
     }
   }
 
-  static func write(tile: Tile, detections: [Detection], to url: URL) throws {
+  static func write(tile: Tile, detections: [Detection], config: DetectionConfig, to url: URL) throws {
     let frame = tile.frame
     let width = frame.width
     let height = frame.height
@@ -687,12 +781,13 @@ enum DetectionOverlayWriter {
         width: detection.bbox.width * CGFloat(width),
         height: detection.bbox.height * CGFloat(height)
       )
-      let color = self.color(for: detection.objectClass)
+      let colorName = config.info(for: detection.classLabel)?.colorName ?? "white"
+      let color = Self.cgColor(named: colorName)
       context.setStrokeColor(color)
       context.setLineWidth(4)
       context.stroke(pxBbox)
 
-      let label = String(format: "%@ %.1fm", detection.objectClass.rawValue, detection.estimatedDistanceMeters)
+      let label = String(format: "%@ %.1fm", detection.classLabel, detection.estimatedDistanceMeters)
       drawText(label, at: CGPoint(x: pxBbox.minX, y: pxBbox.maxY + 4),
                color: color, fontSize: 22, in: context, imageHeight: height)
     }

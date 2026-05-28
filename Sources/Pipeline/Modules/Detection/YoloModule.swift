@@ -18,9 +18,14 @@ public final class YoloModule: PipelineModule, @unchecked Sendable {
 
   public struct Settings: Sendable {
     public var confidenceThreshold: Float
+    public var detectionConfig: DetectionConfig
 
-    public init(confidenceThreshold: Float = 0.25) {
+    public init(
+      confidenceThreshold: Float = 0.25,
+      detectionConfig: DetectionConfig = .default
+    ) {
       self.confidenceThreshold = confidenceThreshold
+      self.detectionConfig = detectionConfig
     }
 
     public static let `default` = Settings()
@@ -28,6 +33,10 @@ public final class YoloModule: PipelineModule, @unchecked Sendable {
 
   private let visionModel: VNCoreMLModel
   private let settings: Settings
+
+  // Expose the active detection config so callers (CLI overlay drawer)
+  // can use the same color/height table that drove the classification.
+  public var config: DetectionConfig { settings.detectionConfig }
 
   public init(mlModel: MLModel, settings: Settings = .default) throws {
     do {
@@ -103,7 +112,7 @@ public final class YoloModule: PipelineModule, @unchecked Sendable {
   ) -> Detection? {
     guard let topLabel = observation.labels.first,
           topLabel.confidence >= settings.confidenceThreshold,
-          let detectionClass = DetectionClass(yoloLabel: topLabel.identifier)
+          let classInfo = settings.detectionConfig.info(for: topLabel.identifier)
     else { return nil }
 
     // Vision returns bbox in normalized coords with origin bottom-left
@@ -133,10 +142,10 @@ public final class YoloModule: PipelineModule, @unchecked Sendable {
     // Distance via pinhole height formula.
     let bboxHeightPx = Float(bbox.height) * Float(tileFrame.height)
     guard bboxHeightPx > 0 else { return nil }
-    let distance = (detectionClass.realWorldHeightMeters * tileFrame.intrinsics.focalLengthY) / bboxHeightPx
+    let distance = (classInfo.heightMeters * tileFrame.intrinsics.focalLengthY) / bboxHeightPx
 
     return Detection(
-      objectClass: detectionClass,
+      classLabel: topLabel.identifier.lowercased(),
       confidence: topLabel.confidence,
       bbox: bbox,
       yawInLensDegrees: yawInLens,

@@ -22,7 +22,8 @@ xcuserdata/
 *.xcworkspace/
 
 # Local test resources (symlinks to personal videos, not for git)
-Resources/
+Resources/*
+!Resources/Config/
 !Resources/.gitkeep
 
 # Generated test outputs
