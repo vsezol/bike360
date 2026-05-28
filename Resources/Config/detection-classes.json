@@ -1,10 +1,10 @@
 {
-  "person":         { "heightMeters": 1.70, "color": "red"    },
-  "bicycle":        { "heightMeters": 1.10, "color": "orange" },
-  "car":            { "heightMeters": 1.50, "color": "green"  },
-  "motorcycle":     { "heightMeters": 1.20, "color": "orange" },
-  "bus":            { "heightMeters": 3.20, "color": "blue"   },
-  "truck":          { "heightMeters": 3.50, "color": "blue"   },
-  "traffic light":  { "heightMeters": 0.90, "color": "yellow" },
-  "stop sign":      { "heightMeters": 0.75, "color": "red"    }
+  "person":       { "heightMeters": 1.70, "color": "red"    },
+  "bicycle":      { "heightMeters": 1.10, "color": "orange" },
+  "car":          { "heightMeters": 1.50, "color": "green"  },
+  "motorcycle":   { "heightMeters": 1.20, "color": "orange" },
+  "bus":          { "heightMeters": 3.20, "color": "blue"   },
+  "truck":        { "heightMeters": 3.50, "color": "blue"   },
+  "trafficLight": { "heightMeters": 0.90, "color": "yellow" },
+  "stopSign":     { "heightMeters": 0.75, "color": "red"    }
 }

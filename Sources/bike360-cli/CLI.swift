@@ -304,13 +304,10 @@ struct CLI {
 
   static func loadDetectionConfig(path: String) throws -> DetectionConfig {
     let url = URL(fileURLWithPath: path)
-    if FileManager.default.fileExists(atPath: url.path) {
-      return try DetectionConfig.load(from: url)
+    guard FileManager.default.fileExists(atPath: url.path) else {
+      throw CLIError.invalidValue(name: "--classes-config", value: "file not found: \(path)")
     }
-    FileHandle.standardError.write(Data(
-      "Warning: detection config not found at \(path); using embedded defaults.\n".utf8
-    ))
-    return .default
+    return try DetectionConfig.load(from: url)
   }
 
   static func writeDetectionsJSON(_ detections: [Detection], frame: Int, to dir: URL) throws {

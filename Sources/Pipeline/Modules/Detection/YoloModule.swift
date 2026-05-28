@@ -22,13 +22,11 @@ public final class YoloModule: PipelineModule, @unchecked Sendable {
 
     public init(
       confidenceThreshold: Float = 0.25,
-      detectionConfig: DetectionConfig = .default
+      detectionConfig: DetectionConfig
     ) {
       self.confidenceThreshold = confidenceThreshold
       self.detectionConfig = detectionConfig
     }
-
-    public static let `default` = Settings()
   }
 
   private let visionModel: VNCoreMLModel
@@ -38,7 +36,7 @@ public final class YoloModule: PipelineModule, @unchecked Sendable {
   // can use the same color/height table that drove the classification.
   public var config: DetectionConfig { settings.detectionConfig }
 
-  public init(mlModel: MLModel, settings: Settings = .default) throws {
+  public init(mlModel: MLModel, settings: Settings) throws {
     do {
       self.visionModel = try VNCoreMLModel(for: mlModel)
     } catch {
@@ -47,7 +45,7 @@ public final class YoloModule: PipelineModule, @unchecked Sendable {
     self.settings = settings
   }
 
-  public convenience init(modelURL: URL, settings: Settings = .default) throws {
+  public convenience init(modelURL: URL, settings: Settings) throws {
     let compiledURL = try Self.resolveCompiledModelURL(from: modelURL)
     let config = MLModelConfiguration()
     config.computeUnits = .all  // ANE + GPU + CPU, auto-routed by Core ML.
@@ -111,9 +109,11 @@ public final class YoloModule: PipelineModule, @unchecked Sendable {
     tile: Tile
   ) -> Detection? {
     guard let topLabel = observation.labels.first,
-          topLabel.confidence >= settings.confidenceThreshold,
-          let classInfo = settings.detectionConfig.info(for: topLabel.identifier)
+          topLabel.confidence >= settings.confidenceThreshold
     else { return nil }
+
+    let camelKey = Self.toCamelCase(topLabel.identifier)
+    guard let classInfo = settings.detectionConfig.info(for: camelKey) else { return nil }
 
     // Vision returns bbox in normalized coords with origin bottom-left
     // (graphics convention). We flip Y so detections speak the same
@@ -145,7 +145,7 @@ public final class YoloModule: PipelineModule, @unchecked Sendable {
     let distance = (classInfo.heightMeters * tileFrame.intrinsics.focalLengthY) / bboxHeightPx
 
     return Detection(
-      classLabel: topLabel.identifier.lowercased(),
+      classLabel: camelKey,
       confidence: topLabel.confidence,
       bbox: bbox,
       yawInLensDegrees: yawInLens,
@@ -155,6 +155,17 @@ public final class YoloModule: PipelineModule, @unchecked Sendable {
       sourceTileYawDegrees: tile.yawDegrees,
       sourceTilePitchDegrees: tile.pitchDegrees
     )
+  }
+}
+
+extension YoloModule {
+  // "traffic light" -> "trafficLight". COCO labels are lowercased words
+  // separated by spaces, so split on space, capitalize tail words, join.
+  static func toCamelCase(_ rawLabel: String) -> String {
+    let parts = rawLabel.lowercased().split(separator: " ", omittingEmptySubsequences: true)
+    guard let head = parts.first else { return "" }
+    let tail = parts.dropFirst().map { $0.prefix(1).uppercased() + $0.dropFirst() }
+    return ([String(head)] + tail).joined()
   }
 }
 
