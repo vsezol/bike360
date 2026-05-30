@@ -19,13 +19,23 @@ public final class YoloModule: PipelineModule, @unchecked Sendable {
   public struct Settings: Sendable {
     public var confidenceThreshold: Float
     public var detectionConfig: DetectionConfig
+    // IoU above which two boxes (any classes) are treated as the same object
+    // by the class-agnostic NMS pass; the lower-confidence one is dropped.
+    public var nmsIoUThreshold: Float
+    // Pluggable distance estimation (ground-plane / pinhole / …), configured
+    // via distance-config.json. See DistanceStrategy.
+    public var distanceEstimator: DistanceEstimator
 
     public init(
       confidenceThreshold: Float = 0.25,
-      detectionConfig: DetectionConfig
+      detectionConfig: DetectionConfig,
+      nmsIoUThreshold: Float = 0.55,
+      distanceEstimator: DistanceEstimator = .default
     ) {
       self.confidenceThreshold = confidenceThreshold
       self.detectionConfig = detectionConfig
+      self.nmsIoUThreshold = nmsIoUThreshold
+      self.distanceEstimator = distanceEstimator
     }
   }
 
@@ -99,9 +109,36 @@ public final class YoloModule: PipelineModule, @unchecked Sendable {
       return []
     }
 
-    return observations.compactMap { observation in
+    let detections = observations.compactMap { observation in
       makeDetection(from: observation, tile: tile)
     }
+    // Vision runs NMS per class, so the same object can survive as two
+    // overlapping boxes of different classes (e.g. a van read as both "truck"
+    // and "car"). They then get different pinhole distances (height depends on
+    // class) and split into two tracks. A class-agnostic NMS pass collapses
+    // such overlaps to the single most-confident box.
+    return Self.classAgnosticNMS(detections, iouThreshold: settings.nmsIoUThreshold)
+  }
+
+  // Greedy non-max suppression across ALL classes: keep boxes in descending
+  // confidence, drop any that overlaps an already-kept box beyond the IoU
+  // threshold regardless of its class.
+  static func classAgnosticNMS(_ detections: [Detection], iouThreshold: Float) -> [Detection] {
+    let ordered = detections.sorted { $0.confidence > $1.confidence }
+    var kept: [Detection] = []
+    for detection in ordered {
+      let overlaps = kept.contains { intersectionOverUnion($0.bbox, detection.bbox) > iouThreshold }
+      if !overlaps { kept.append(detection) }
+    }
+    return kept
+  }
+
+  static func intersectionOverUnion(_ a: CGRect, _ b: CGRect) -> Float {
+    let intersection = a.intersection(b)
+    guard !intersection.isNull else { return 0 }
+    let interArea = Float(intersection.width * intersection.height)
+    let union = Float(a.width * a.height + b.width * b.height) - interArea
+    return union > 0 ? interArea / union : 0
   }
 
   private func makeDetection(
@@ -139,10 +176,30 @@ public final class YoloModule: PipelineModule, @unchecked Sendable {
     let yawInLens = tile.yawDegrees + yawOffsetDeg
     let pitchInLens = tile.pitchDegrees + pitchOffsetDeg
 
-    // Distance via pinhole height formula.
-    let bboxHeightPx = Float(bbox.height) * Float(tileFrame.height)
-    guard bboxHeightPx > 0 else { return nil }
-    let distance = (classInfo.heightMeters * tileFrame.intrinsics.focalLengthY) / bboxHeightPx
+    // Distance via the configured strategies (ground-plane / pinhole / …),
+    // each responsible for its own range band. See DistanceStrategy and
+    // distance-config.json — no method-specific branching lives here anymore.
+    guard let distance = settings.distanceEstimator.estimate(
+      bbox: bbox,
+      intrinsics: tileFrame.intrinsics,
+      tilePitchDegrees: tile.pitchDegrees,
+      classHeightMeters: classInfo.heightMeters
+    ) else { return nil }
+
+    // Sanity range: discard implausible distances.
+    guard distance >= 0.5, distance <= 80 else { return nil }
+
+    // Reject the rig itself. Two consistent false-positive sources on a
+    // helmet-mounted 360 cam, confirmed in the data:
+    //  1. The rear lens sees the rider's/passenger's own body ~1–1.5 m back
+    //     as a stable "person" — anything within 2.5 m is the rig, not road.
+    //  2. Handlebars, mirrors and the road right under the nose sit in the
+    //     lower fisheye zone and read as steeply-downward (pitch < −28°)
+    //     bicycle/motorcycle detections.
+    // NOTE: 2.5 m threshold is tuned for the current helmet mount; revisit
+    // if the camera moves.
+    if distance < 2.5 { return nil }
+    if pitchInLens < -28 { return nil }
 
     return Detection(
       classLabel: camelKey,

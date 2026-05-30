@@ -27,11 +27,15 @@ public final class SpatialFusionModule: PipelineModule, Sendable {
   public typealias Output = [WorldDetection]
 
   public struct Settings: Sendable {
-    // Angular distance between two detections under which they're
-    // considered "same direction" (degrees on the unit sphere).
-    public var angularMergeThresholdDegrees: Float
+    // Maximum LATERAL (cross-track) separation under which two detections are
+    // taken to be the same physical object, in meters. This is distance-
+    // invariant, unlike a fixed angular threshold: a duplicate of one car is
+    // <~1 m apart sideways at ANY range, while two cars in adjacent lanes are
+    // >2.5 m apart whether they're at 5 m or 50 m. A fixed angle can't tell
+    // those apart (it merges far-but-distinct cars or splits near duplicates).
+    public var lateralMergeThresholdMeters: Float
     // Relative distance difference under which they're considered "same
-    // depth". 0.30 means within 30% of each other.
+    // depth". 0.35 means within 35% of each other.
     public var distanceRatioThreshold: Float
     // Treat both lenses' detections as overlapping at the seams (90°,
     // -90° in bike frame). If false, front-only objects can't merge with
@@ -39,11 +43,11 @@ public final class SpatialFusionModule: PipelineModule, Sendable {
     public var allowCrossLensMerge: Bool
 
     public init(
-      angularMergeThresholdDegrees: Float = 5.0,
-      distanceRatioThreshold: Float = 0.30,
+      lateralMergeThresholdMeters: Float = 1.5,
+      distanceRatioThreshold: Float = 0.35,
       allowCrossLensMerge: Bool = true
     ) {
-      self.angularMergeThresholdDegrees = angularMergeThresholdDegrees
+      self.lateralMergeThresholdMeters = lateralMergeThresholdMeters
       self.distanceRatioThreshold = distanceRatioThreshold
       self.allowCrossLensMerge = allowCrossLensMerge
     }
@@ -126,7 +130,6 @@ public final class SpatialFusionModule: PipelineModule, Sendable {
     guard n > 0 else { return [] }
 
     var uf = UnionFind(count: n)
-    let angularThreshold = settings.angularMergeThresholdDegrees
 
     for i in 0..<n {
       for j in (i + 1)..<n {
@@ -136,11 +139,16 @@ public final class SpatialFusionModule: PipelineModule, Sendable {
         if a.classLabel != b.classLabel { continue }
         if !settings.allowCrossLensMerge && a.lens != b.lens { continue }
 
+        // Lateral separation = (angular gap) projected to meters at this
+        // range. Two detections of one object stay within ~1 m sideways;
+        // distinct vehicles are farther regardless of distance.
         let angDist = Self.angularDistanceDegrees(
           yaw1: a.yawInBike, pitch1: a.pitchInBike,
           yaw2: b.yawInBike, pitch2: b.pitchInBike
         )
-        if angDist > angularThreshold { continue }
+        let avgDistance = (a.distance + b.distance) / 2
+        let lateral = avgDistance * sin(angDist * .pi / 180)
+        if lateral > settings.lateralMergeThresholdMeters { continue }
 
         let dRatio = abs(a.distance - b.distance) / max(a.distance, b.distance)
         if dRatio > settings.distanceRatioThreshold { continue }

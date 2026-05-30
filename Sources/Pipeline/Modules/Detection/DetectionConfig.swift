@@ -9,20 +9,30 @@ import Foundation
 // YoloModule before the lookup happens):
 //
 //   {
-//     "car":          { "heightMeters": 1.50, "color": "green" },
-//     "trafficLight": { "heightMeters": 0.90, "color": "yellow" },
+//     "car":          { "heightMeters": 1.50, "widthMeters": 1.80, "lengthMeters": 4.30, "color": "green" },
+//     "trafficLight": { "heightMeters": 0.90, "widthMeters": 0.30, "lengthMeters": 0.30, "color": "yellow" },
 //     ...
 //   }
+//
+// heightMeters drives distance estimation (pinhole). width/length are the
+// object's real-world footprint, used by the 3D map to size each box
+// proportionally to the actual vehicle/person it represents.
 //
 // Anything the YOLO model returns that's NOT in this map is filtered out —
 // this restricts COCO 80 to our traffic-relevant subset.
 public struct DetectionConfig: Sendable {
   public struct ClassInfo: Sendable, Hashable {
     public let heightMeters: Float
+    // Real-world footprint, in meters. width = across the object,
+    // length = along its direction of travel. Consumed by the 3D map.
+    public let widthMeters: Float
+    public let lengthMeters: Float
     public let colorName: String
 
-    public init(heightMeters: Float, colorName: String) {
+    public init(heightMeters: Float, widthMeters: Float, lengthMeters: Float, colorName: String) {
       self.heightMeters = heightMeters
+      self.widthMeters = widthMeters
+      self.lengthMeters = lengthMeters
       self.colorName = colorName
     }
   }
@@ -45,6 +55,8 @@ public struct DetectionConfig: Sendable {
     let mapped = dict.reduce(into: [String: ClassInfo]()) { result, pair in
       result[pair.key] = ClassInfo(
         heightMeters: pair.value.heightMeters,
+        widthMeters: pair.value.widthMeters,
+        lengthMeters: pair.value.lengthMeters,
         colorName: pair.value.color
       )
     }
@@ -53,6 +65,8 @@ public struct DetectionConfig: Sendable {
 
   private struct RawClassInfo: Decodable {
     let heightMeters: Float
+    let widthMeters: Float
+    let lengthMeters: Float
     let color: String
   }
 }

@@ -38,3 +38,10 @@ Resources/Models/*.onnx
 
 # Internal docs (planning notes, posts, diagrams — not for public repo)
 internal-docs/
+
+# iOS app — generated artifacts. We keep sources, project.yml and the small
+# config JSONs; the rest is produced by xcodegen / xcodebuild / export-track.
+App/build/
+App/Bike360.xcodeproj/
+App/Resources/track.json
+App/Resources/frames/

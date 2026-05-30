@@ -35,6 +35,8 @@ struct CLI {
       try await runExtract(options: options)
     case .batch(let options):
       try await runBatch(options: options)
+    case .exportTrack(let options):
+      try await runExportTrack(options: options)
     }
   }
 
@@ -144,6 +146,123 @@ struct CLI {
     print()
     print(String(format: "Done. %d frames in %.1fs (%.1f fps avg, %d PNGs written)",
                  processed, total, Double(processed) / total, processed * (options.undistortSettings.tileCount * 2)))
+  }
+
+  // Runs the full pipeline (undistort → YOLO → fusion → tracking) over a
+  // frame range and writes ONE consolidated JSON of [TrackedObject] per
+  // frame — the playback file the 3D map app replays. No PNGs, so it's
+  // far faster than `batch` and produces a single compact artifact.
+  static func runExportTrack(options: ExportTrackOptions) async throws {
+    let videoURL = URL(fileURLWithPath: options.videoPath)
+    let outputURL = URL(fileURLWithPath: options.outputFile)
+    try FileManager.default.createDirectory(
+      at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true
+    )
+
+    let framesURL: URL? = options.framesDir.map { URL(fileURLWithPath: $0) }
+    if let framesURL {
+      try FileManager.default.createDirectory(at: framesURL, withIntermediateDirectories: true)
+    }
+
+    let source = InsvVideoSource(url: videoURL)
+    let preprocessing = options.preprocess ? PreprocessingModule() : nil
+    let metal = try MetalContext()
+    let undistorting = try UndistortingModule(context: metal, settings: options.undistortSettings)
+
+    print("Loading detection config from \(options.classesConfigPath)...")
+    let config = try loadDetectionConfig(path: options.classesConfigPath)
+    print("Loading YOLO model from \(options.modelPath)...")
+    let distanceConfig = try DistanceConfig.load(
+      from: URL(fileURLWithPath: options.distanceConfigPath)
+    )
+    let enabledStrategies = distanceConfig.estimator.strategies.filter(\.isEnabled).map(\.name)
+    let yolo = try YoloModule(
+      modelURL: URL(fileURLWithPath: options.modelPath),
+      settings: YoloModule.Settings(
+        detectionConfig: config,
+        distanceEstimator: distanceConfig.estimator
+      )
+    )
+    print("YOLO model loaded (camera height \(distanceConfig.cameraHeightMeters) m, distance: \(enabledStrategies.joined(separator: " + "))).")
+
+    let fusion = SpatialFusionModule()
+    let tracker = TrackingModule()
+
+    let startIndex = UInt64(options.startFrame)
+    let endIndex = startIndex + UInt64(options.count)
+    var currentIndex: UInt64 = 0
+    var processed = 0
+    var frames: [TrackFrameDTO] = []
+    let started = Date()
+
+    print("Export-track: \(options.count) frames from \(options.startFrame)")
+    print("Output: \(outputURL.path)")
+    print("Tiles per frame: \(options.undistortSettings.tileCount * 2)")
+    print()
+
+    for try await stereo in source.frames() {
+      if currentIndex >= endIndex { break }
+      if currentIndex < startIndex {
+        currentIndex += 1
+        continue
+      }
+
+      var current = stereo
+      if let preprocessing {
+        current = try await preprocessing.process(current)
+      }
+      let tiled = try await undistorting.process(current)
+      let detections = try await runYoloParallel(yolo: yolo, tiles: tiled.tiles)
+      let worldDetections = try await fusion.process(SpatialFusionInput(
+        detections: detections,
+        helmetOrientation: .zero(),
+        bikeOrientation: .zero()
+      ))
+      let tracked = try await tracker.process(TrackingInput(
+        detections: worldDetections,
+        frameTimestamp: stereo.captureTimestamp,
+        frameNumber: currentIndex
+      ))
+
+      if let framesURL {
+        try MosaicFrameWriter.write(
+          tiles: tiled.tiles, detections: detections, tracked: tracked,
+          config: config, frameIndex: Int(currentIndex), to: framesURL
+        )
+      }
+
+      let rawSeconds = CMTimeGetSeconds(stereo.captureTimestamp)
+      let seconds = rawSeconds.isFinite ? rawSeconds : Double(currentIndex) / 30.0
+      frames.append(TrackFrameDTO(
+        frameNumber: Int(currentIndex),
+        timestampSeconds: seconds,
+        objects: tracked.map(TrackedObjectDTO.init)
+      ))
+
+      processed += 1
+      if processed % 50 == 0 || processed == options.count {
+        let fps = Double(processed) / Date().timeIntervalSince(started)
+        print(String(format: "  %d/%d frames | %.1f fps", processed, options.count, fps))
+      }
+      currentIndex += 1
+    }
+
+    let payload = TrackSessionPayload(
+      videoPath: options.videoPath,
+      startFrame: options.startFrame,
+      frameCount: frames.count,
+      frames: frames
+    )
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    let data = try encoder.encode(payload)
+    try data.write(to: outputURL)
+
+    let total = Date().timeIntervalSince(started)
+    print()
+    print(String(format: "Done. %d frames in %.1fs (%.1f fps) -> %@ (%.0f KB)",
+                 frames.count, total, Double(frames.count) / total,
+                 outputURL.lastPathComponent, Double(data.count) / 1024))
   }
 
   // Same naming scheme as writeBatchTiles. If `tracked` is provided, each
@@ -566,9 +685,24 @@ struct CLI {
           Files named: NNNNNN_<lens>_yaw±N[_pitch±N].png (zero-padded
           so they sort lexicographically).
 
+        export-track <video> <start> <count> [options]
+
+          Run the full pipeline (undistort → YOLO → fusion → tracking)
+          over a frame range and write ONE consolidated JSON of tracked
+          objects per frame — the playback file the 3D map app replays.
+          No PNGs, so much faster than `batch`.
+
+          Options:
+            --output FILE       Output JSON path.       Default: ./out/track.json
+            --preprocess        Apply PreprocessingModule.
+            --tiles N           Rectilinear tiles per lens (1|2|3). Default: 3
+            --model PATH        YOLO .mlpackage path.
+            --classes-config PATH  detection-classes.json path.
+
       Examples:
         bike360-cli extract Resources/test_video_insv.mp4 100 --preprocess --undistort
         bike360-cli batch Resources/test_video_insv.mp4 13000 1000 --preprocess
+        bike360-cli export-track Resources/test_video_insv.mp4 13000 500 --output out/track.json
       """
     )
   }
@@ -602,6 +736,22 @@ struct BatchOptions {
   var undistortSettings: UndistortingModule.Settings = .threeTilesPerLens
 }
 
+struct ExportTrackOptions {
+  var videoPath: String
+  var startFrame: Int
+  var count: Int
+  var outputFile: String = "./out/track.json"
+  var preprocess: Bool = false
+  var modelPath: String = "Resources/Models/yolo11n.mlpackage"
+  var classesConfigPath: String = "Resources/Config/detection-classes.json"
+  var undistortSettings: UndistortingModule.Settings = .threeTilesPerLens
+  // If set, also write a per-frame mosaic JPEG (6 tiles + overlays) here,
+  // named frame_NNNNNN.jpg — the app's debug "camera" strip.
+  var framesDir: String? = nil
+  // Distance-estimation strategy config (ground-plane / pinhole + ranges).
+  var distanceConfigPath: String = "Resources/Config/distance-config.json"
+}
+
 extension UndistortingModule.Settings {
   var tileCount: Int {
     switch projection {
@@ -633,6 +783,7 @@ enum ArgParser {
     case help
     case extract(ExtractOptions)
     case batch(BatchOptions)
+    case exportTrack(ExportTrackOptions)
   }
 
   static func parse(_ args: [String]) throws -> ParseResult {
@@ -643,6 +794,8 @@ enum ArgParser {
       return .help
     case "batch":
       return try parseBatch(args)
+    case "export-track":
+      return try parseExportTrack(args)
     case "extract":
       guard args.count >= 3 else { throw CLIError.missingArgument("video path") }
       guard args.count >= 4 else { throw CLIError.missingArgument("frame index") }
@@ -763,6 +916,53 @@ enum ArgParser {
     return .batch(options)
   }
 
+  static func parseExportTrack(_ args: [String]) throws -> ParseResult {
+    guard args.count >= 3 else { throw CLIError.missingArgument("video path") }
+    guard args.count >= 4 else { throw CLIError.missingArgument("start frame") }
+    guard args.count >= 5 else { throw CLIError.missingArgument("count") }
+    guard let start = Int(args[3]) else { throw CLIError.invalidValue(name: "start", value: args[3]) }
+    guard let count = Int(args[4]) else { throw CLIError.invalidValue(name: "count", value: args[4]) }
+
+    var options = ExportTrackOptions(videoPath: args[2], startFrame: start, count: count)
+    var i = 5
+    while i < args.count {
+      switch args[i] {
+      case "--output":
+        guard i + 1 < args.count else { throw CLIError.missingArgument("--output value") }
+        options.outputFile = args[i + 1]
+        i += 2
+      case "--frames-dir":
+        guard i + 1 < args.count else { throw CLIError.missingArgument("--frames-dir value") }
+        options.framesDir = args[i + 1]
+        i += 2
+      case "--distance-config":
+        guard i + 1 < args.count else { throw CLIError.missingArgument("--distance-config value") }
+        options.distanceConfigPath = args[i + 1]
+        i += 2
+      case "--preprocess":
+        options.preprocess = true
+        i += 1
+      case "--tiles":
+        guard i + 1 < args.count, let value = Int(args[i + 1]) else {
+          throw CLIError.invalidValue(name: "--tiles", value: args[safe: i + 1] ?? "")
+        }
+        options.undistortSettings = try makeTileSettings(count: value)
+        i += 2
+      case "--model":
+        guard i + 1 < args.count else { throw CLIError.missingArgument("--model value") }
+        options.modelPath = args[i + 1]
+        i += 2
+      case "--classes-config":
+        guard i + 1 < args.count else { throw CLIError.missingArgument("--classes-config value") }
+        options.classesConfigPath = args[i + 1]
+        i += 2
+      default:
+        throw CLIError.unknownCommand(args[i])
+      }
+    }
+    return .exportTrack(options)
+  }
+
   static func makeTileSettings(count: Int) throws -> UndistortingModule.Settings {
     switch count {
     case 1: return .singleCenterTile
@@ -862,6 +1062,21 @@ struct DetectionsPayload: Encodable {
 
 struct TrackedObjectsPayload: Encodable {
   let frame: Int
+  let objects: [TrackedObjectDTO]
+}
+
+// Consolidated multi-frame track session — the single artifact the 3D map
+// app loads and replays. One TrackFrameDTO per processed frame, in order.
+struct TrackSessionPayload: Encodable {
+  let videoPath: String
+  let startFrame: Int
+  let frameCount: Int
+  let frames: [TrackFrameDTO]
+}
+
+struct TrackFrameDTO: Encodable {
+  let frameNumber: Int
+  let timestampSeconds: Double
   let objects: [TrackedObjectDTO]
 }
 
@@ -997,13 +1212,14 @@ enum DetectionOverlayWriter {
     return CGColor(red: r, green: g, blue: b, alpha: 1)
   }
 
-  static func write(
+  // Renders a tile with its detection/tracking overlay into a CGImage.
+  // Shared by the PNG writer and the mosaic-frame writer.
+  static func makeImage(
     tile: Tile,
     detections: [Detection],
     trackingLabels: [Detection: TrackingLabelInfo]? = nil,
-    config: DetectionConfig,
-    to url: URL
-  ) throws {
+    config: DetectionConfig
+  ) throws -> CGImage {
     let frame = tile.frame
     let width = frame.width
     let height = frame.height
@@ -1064,6 +1280,19 @@ enum DetectionOverlayWriter {
     guard let cgImage = context.makeImage() else {
       throw CLIError.invalidValue(name: "overlay", value: "context.makeImage() failed")
     }
+    return cgImage
+  }
+
+  static func write(
+    tile: Tile,
+    detections: [Detection],
+    trackingLabels: [Detection: TrackingLabelInfo]? = nil,
+    config: DetectionConfig,
+    to url: URL
+  ) throws {
+    let cgImage = try makeImage(
+      tile: tile, detections: detections, trackingLabels: trackingLabels, config: config
+    )
     guard let dest = CGImageDestinationCreateWithURL(
       url as CFURL, UTType.png.identifier as CFString, 1, nil
     ) else {
@@ -1111,6 +1340,78 @@ enum DetectionOverlayWriter {
     context.textPosition = CGPoint(x: 0, y: 0)
     CTLineDraw(line, context)
     context.restoreGState()
+  }
+}
+
+// Composes the 6 tiles (front/back × 3 yaws) of one frame into a single JPEG
+// with detection/tracking overlays — the per-frame "camera" image the app
+// shows under the 3D map in debug split-view. Named by frame number so the
+// app looks it up by the same frameIndex that drives the map (free sync).
+enum MosaicFrameWriter {
+  static func write(
+    tiles: [Tile],
+    detections: [Detection],
+    tracked: [TrackedObject]?,
+    config: DetectionConfig,
+    frameIndex: Int,
+    to dir: URL,
+    tileSize: Int = 480,
+    jpegQuality: CGFloat = 0.6
+  ) throws {
+    let yaws: [Float] = [-60, 0, 60]
+    let lensRows: [Lens] = [.front, .back]
+    let mosaicWidth = yaws.count * tileSize
+    let mosaicHeight = lensRows.count * tileSize
+
+    guard let context = CGContext(
+      data: nil, width: mosaicWidth, height: mosaicHeight,
+      bitsPerComponent: 8, bytesPerRow: 4 * mosaicWidth,
+      space: PNGWriter.colorSpace,
+      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else {
+      throw CLIError.invalidValue(name: "mosaic-frame", value: "CGContext creation failed")
+    }
+    context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: mosaicWidth, height: mosaicHeight))
+
+    for (row, lens) in lensRows.enumerated() {
+      for (col, yaw) in yaws.enumerated() {
+        guard let tile = tiles.first(where: { $0.lens == lens && $0.yawDegrees == yaw })
+        else { continue }
+        let tileDetections = detections.filter {
+          $0.lens == lens && $0.sourceTileYawDegrees == yaw
+            && $0.sourceTilePitchDegrees == tile.pitchDegrees
+        }
+        let labels: [Detection: TrackingLabelInfo]? = tracked.map { tracked in
+          var map: [Detection: TrackingLabelInfo] = [:]
+          for detection in tileDetections {
+            map[detection] = CLI.closestTrack(for: detection, in: tracked)
+          }
+          return map
+        }
+        let image = try DetectionOverlayWriter.makeImage(
+          tile: tile, detections: tileDetections, trackingLabels: labels, config: config
+        )
+        // Row 0 (front) on top. CGContext origin is bottom-left.
+        let cgY = mosaicHeight - (row + 1) * tileSize
+        context.draw(image, in: CGRect(x: col * tileSize, y: cgY, width: tileSize, height: tileSize))
+      }
+    }
+
+    guard let mosaic = context.makeImage() else {
+      throw CLIError.invalidValue(name: "mosaic-frame", value: "context.makeImage() failed")
+    }
+    let url = dir.appendingPathComponent(String(format: "frame_%06d.jpg", frameIndex))
+    guard let dest = CGImageDestinationCreateWithURL(
+      url as CFURL, UTType.jpeg.identifier as CFString, 1, nil
+    ) else {
+      throw CLIError.invalidValue(name: "mosaic-frame", value: "destination creation failed")
+    }
+    let options: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: jpegQuality]
+    CGImageDestinationAddImage(dest, mosaic, options as CFDictionary)
+    guard CGImageDestinationFinalize(dest) else {
+      throw CLIError.invalidValue(name: "mosaic-frame", value: "finalize failed")
+    }
   }
 }
 

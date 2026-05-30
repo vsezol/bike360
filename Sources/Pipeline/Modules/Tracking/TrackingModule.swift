@@ -39,6 +39,12 @@ public actor TrackingModule: PipelineModule {
     // Exponential smoothing factor for velocity estimates [0..1].
     // 0.3 — moderate inertia, suitable for ~30 fps.
     public var velocitySmoothing: Float
+    // How many missed frames a track may still be EMITTED for. Tracks are
+    // kept internally up to maxLostFrames for re-matching, but emitting a
+    // track that hasn't matched for many frames draws a ghost next to the
+    // object that already moved on — a visible duplicate. A small grace
+    // (1–2) survives a single dropped detection without flicker.
+    public var displayGraceFrames: Int
 
     public init(
       highConfidenceThreshold: Float = 0.5,
@@ -46,7 +52,8 @@ public actor TrackingModule: PipelineModule {
       maxLostFrames: Int = 10,
       reliabilityThreshold: Int = 3,
       classHistoryWindow: Int = 10,
-      velocitySmoothing: Float = 0.3
+      velocitySmoothing: Float = 0.3,
+      displayGraceFrames: Int = 2
     ) {
       self.highConfidenceThreshold = highConfidenceThreshold
       self.maxMatchCost = maxMatchCost
@@ -54,6 +61,7 @@ public actor TrackingModule: PipelineModule {
       self.reliabilityThreshold = reliabilityThreshold
       self.classHistoryWindow = classHistoryWindow
       self.velocitySmoothing = velocitySmoothing
+      self.displayGraceFrames = displayGraceFrames
     }
 
     public static let `default` = Settings()
@@ -95,7 +103,9 @@ public actor TrackingModule: PipelineModule {
       for i in 0..<tracks.count {
         tracks[i].yawDegrees = wrapYaw(tracks[i].yawDegrees + tracks[i].yawVelocityDegPerSec * dt)
         tracks[i].pitchDegrees += tracks[i].pitchVelocityDegPerSec * dt
-        tracks[i].distanceMeters += tracks[i].distanceVelocityMPerSec * dt
+        // Clamp: a lost, approaching track must not extrapolate through 0
+        // into negative distance (which then renders behind the rider).
+        tracks[i].distanceMeters = max(0.1, tracks[i].distanceMeters + tracks[i].distanceVelocityMPerSec * dt)
       }
     }
 
@@ -148,9 +158,13 @@ public actor TrackingModule: PipelineModule {
     }
     tracks.removeAll { $0.framesSinceLastMatch > settings.maxLostFrames }
 
-    // 7. Emit current tracks (including lost-but-still-living ones, so the
-    // UI doesn't blink them off for a single dropped frame).
-    return tracks.map(makeTrackedObject)
+    // 7. Emit only recently-seen tracks. Lost tracks live on internally (up
+    // to maxLostFrames) so a returning object re-matches its old id, but we
+    // don't DRAW a track that's been missing for more than displayGraceFrames
+    // — that ghost is what duplicates a moved object on screen.
+    return tracks
+      .filter { $0.framesSinceLastMatch <= settings.displayGraceFrames }
+      .map(makeTrackedObject)
   }
 
   // MARK: - Matching helpers

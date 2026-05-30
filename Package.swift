@@ -16,7 +16,12 @@ let package = Package(
       name: "Pipeline",
       path: "Sources/Pipeline",
       resources: [
-        .process("Modules/Undistorting/FisheyeUndistorter.metal"),
+        // .copy (not .process): the shader is compiled at runtime via
+        // device.makeLibrary(source:), so it must ship as plain text. Under
+        // Xcode 26 .process invokes the Metal compiler (a separate
+        // downloadable toolchain) and fails the build; .copy just bundles
+        // the raw file, which is all the runtime loader needs.
+        .copy("Modules/Undistorting/FisheyeUndistorter.metal"),
       ],
       swiftSettings: [
         .swiftLanguageMode(.v6),

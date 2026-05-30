@@ -1,0 +1,7 @@
+{
+  "cameraHeightMeters": 1.0,
+  "strategies": [
+    { "name": "groundPlane", "enabled": true, "minRangeMeters": 0, "maxRangeMeters": 40 },
+    { "name": "pinhole", "enabled": true, "minRangeMeters": 40, "maxRangeMeters": 80, "maxHeightCapMeters": 2.0 }
+  ]
+}
